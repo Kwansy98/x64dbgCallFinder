@@ -12,35 +12,77 @@ using namespace Script::Register;
 
 void SystemBreakpointCallback(CBTYPE bType, void*callbackInfo);
 void DetachCallback(CBTYPE bType, void*callbackInfo);
+void AttachCallback(CBTYPE bType, void*callbackInfo);
+void BreakPointCallback(CBTYPE bType, void*callbackInfo);
 
 std::map<duint, int> g_functionCallCount;
 
 duint g_oep = 0;
 bool g_scanExeOnly = true; // only scan exe by default
-
+bool g_fastMode = true;
 
 //Initialize your plugin data here.
 bool pluginInit(PLUG_INITSTRUCT* initStruct)
 {
-	
+	Cmd("cleardb");
 	_plugin_registercallback(g_pluginHandle, CB_SYSTEMBREAKPOINT, SystemBreakpointCallback);
 	_plugin_registercallback(g_pluginHandle, CB_DETACH, DetachCallback);
-	
+	_plugin_registercallback(g_pluginHandle, CB_DETACH, AttachCallback);
+	_plugin_registercallback(g_pluginHandle, CB_BREAKPOINT, BreakPointCallback);
+
 	return true; //Return false to cancel loading the plugin.
 }
 
+void DisableLogAndUi()
+{
+	Cmd("LogDisable");
+	GuiUpdateDisable();
+	GuiDisableLog();
+}
 
+void EnableLogAndUi()
+{
+	Cmd("LogEnable");
+	GuiUpdateEnable(true);
+	GuiEnableLog();
+}
+
+void SetBreakPointNotBreak(duint addr)
+{
+	constexpr int cmdSize = 0x100;
+	char cmd[cmdSize];
+
+	sprintf_s(cmd, cmdSize, "bp %p", (PVOID)addr);
+	Cmd(cmd);
+	sprintf_s(cmd, cmdSize, "bpcnd %p,\"0\"", (PVOID)addr); // break if 0
+	Cmd(cmd);
+}
+
+bool IsInstructionContains(duint addr, LPCSTR keyword)
+{
+	constexpr int cmdSize = 0x100;
+	char cmd[cmdSize];
+	sprintf_s(cmd, cmdSize, "strstr(dis.text(%p), \"%s\")", (PVOID)addr, keyword);
+	return DbgEval(cmd) ? true : false;
+}
+
+bool IsInstructionUnusual(duint addr)
+{
+	constexpr int cmdSize = 0x100;
+	char cmd[cmdSize];
+	sprintf_s(cmd, cmdSize, "dis.isunusual(%p)", (PVOID)addr);
+	return DbgEval(cmd) ? true : false;
+}
 
 // find all user defined functions in secific module, return number of functions found
 int ScanFunctionOnModule(duint base, duint size)
 {
 	constexpr int cmdSize = 0x100;
 	char cmd[cmdSize] = { 0 };
-
-	PUCHAR startAddress = (PUCHAR)base;
-	PUCHAR endAddress = (PUCHAR)base + size;
-	PUCHAR addr = (PUCHAR)startAddress;
-	addr = (PUCHAR)PAGE_ALIGN(addr);
+	duint startAddress = base;
+	duint endAddress = base + size;
+	duint addr = startAddress;
+	addr = PAGE_ALIGN(addr);
 
 	size_t originCnt = g_functionCallCount.size();
 
@@ -49,39 +91,62 @@ int ScanFunctionOnModule(duint base, duint size)
 		// if not code, then skip this page
 		if (((ULONG_PTR)addr == PAGE_ALIGN(addr)))
 		{
-			sprintf_s(cmd, cmdSize, "mem.iscode(%p)", addr);
+			sprintf_s(cmd, cmdSize, "mem.iscode(%p)", (PVOID)addr);
 			if (!DbgEval(cmd))
 			{
-				addr = PUCHAR(addr + PAGE_SIZE);
+				addr = addr + PAGE_SIZE;
 				continue;
 			}
 		}
 
-		unsigned char dest[2];
-		if (DbgMemRead((duint)addr, dest, 2))
+		// is call ?
+		sprintf_s(cmd, cmdSize, "dis.iscall(%p)", (PVOID)addr);
+		if (DbgEval(cmd))
 		{
-			// seems like a call
-			if (dest[0] == 0xE8 || (dest[0] == 0xFF && dest[1] == 0x15))
+			// try to eval dst address
+			DISASM_INSTR di;
+			DbgDisasmAt((duint)addr, &di);
+			duint FuncAddr = di.arg[0].value;
+			
+			// is dst a user function ?
+			sprintf_s(cmd, cmdSize, "mem.iscode(%p) && mod.user(%p)", (PVOID)FuncAddr, (PVOID)FuncAddr);
+			if (DbgEval(cmd))
 			{
-				// get dst addr
-				DISASM_INSTR di;
-				DbgDisasmAt((duint)addr, &di);
-				duint FuncAddr = di.arg[0].value;
-
-				// dst addr is code
-				sprintf_s(cmd, cmdSize, "mem.iscode(%p)", (PVOID)FuncAddr);
-				if (DbgEval(cmd))
+				if (!g_fastMode)
 				{
-					// is user function
-					sprintf_s(cmd, cmdSize, "mod.user(%p)", (PVOID)FuncAddr);
+					g_functionCallCount[FuncAddr] = 0;
+				}
+				else
+				{
+					// fast mode does more checks because we want to minimize the number of breakpoints
+					if (IsInstructionContains(FuncAddr, "mov ") ||
+						IsInstructionContains(FuncAddr, "push ") ||
+						IsInstructionContains(FuncAddr, "sub ") ||
+						IsInstructionContains(FuncAddr, "lea ") ||
+						IsInstructionContains(FuncAddr, "cmp ") ||
+						IsInstructionContains(FuncAddr, "xor "))
+					{
+						g_functionCallCount[FuncAddr] = 0;
+					}
+				}
+			}
+			else
+			{
+				// can't get dst addr, or dst not a user function, only thing we can do is set breakpoint at call instruction
+				sprintf_s(cmd, cmdSize, "dis.iscallsystem(%p)", (PVOID)addr);
+				if (!DbgEval(cmd))
+				{
+					sprintf_s(cmd, cmdSize, "dis.imm(%p) != 0 && !mem.iscode(dis.imm(%p))", (PVOID)addr, (PVOID)addr);
 					if (DbgEval(cmd))
 					{
-						// is it jmp to system module?
-						sprintf_s(cmd, cmdSize, "dis.iscallsystem(%p)", (PVOID)FuncAddr);
-						if (!DbgEval(cmd))
+						// invalid instruction
+					}
+					else
+					{
+						sprintf_s(cmd, cmdSize, "dis.next(dis.prev(%p)) == %p", (PVOID)addr, (PVOID)addr);
+						if (DbgEval(cmd))
 						{
-							// we find a function
-							g_functionCallCount[FuncAddr] = 0;
+							g_functionCallCount[addr] = 0;
 						}
 					}
 				}
@@ -97,7 +162,7 @@ int ScanFunctionOnModule(duint base, duint size)
 void FindAllUserFunctions()
 {
 	g_functionCallCount.clear();
-	
+
 	constexpr int cmdSize = 0x100;
 	char cmd[cmdSize] = { 0 };
 
@@ -134,11 +199,28 @@ void FindAllUserFunctions()
 void SystemBreakpointCallback(CBTYPE bType, void*callbackInfo)
 {
 	g_oep = 0;
+
 	Cmd("bc");
+
+	EnableLogAndUi();
+}
+
+void BreakPointCallback(CBTYPE bType, void*callbackInfo)
+{
 }
 
 void DetachCallback(CBTYPE bType, void*callbackInfo)
 {
+	Cmd("bc");
+
+	EnableLogAndUi();
+}
+
+void AttachCallback(CBTYPE bType, void*callbackInfo)
+{
+	Cmd("bc");
+
+	EnableLogAndUi();
 }
 
 HWND g_pluginDlg = 0;
@@ -148,34 +230,21 @@ HWND hButtonNewSearch;
 HWND hEditCallCount;
 HWND hEditResult;
 HWND hCheckExeOnly;
+HWND hCheckFastMode;
 
-// just don't want to block x64dbg, but not work as expect
 DWORD WINAPI SettingBreakPointThread(LPVOID)
 {
-	// Cmd
+	FindAllUserFunctions();
 
 	SetWindowTextA(hEditResult, "setting break point...");
 
-	//Script::Debug::Pause();
-
-	Cmd("LogDisable");
-	GuiUpdateDisable();
-	GuiDisableLog();
+	DisableLogAndUi();
 	for (auto &item : g_functionCallCount)
 	{
-		constexpr int cmdSize = 0x100;
-		char cmd[cmdSize];
-
 		duint addr = item.first;
-		sprintf_s(cmd, cmdSize, "bp %p", (PVOID)addr);
-		Cmd(cmd);
-		sprintf_s(cmd, cmdSize, "bpcnd %p,\"0\"", (PVOID)addr); // break if 0
-		Cmd(cmd);
+		SetBreakPointNotBreak(addr);
 	}
-	Cmd("LogEnable");
-	GuiUpdateEnable(true);
-	GuiEnableLog();
-	//Script::Debug::Run();
+	EnableLogAndUi();
 
 	constexpr int outputSize = 0x100;
 	char output[outputSize] = { 0 };
@@ -188,6 +257,7 @@ DWORD WINAPI SettingBreakPointThread(LPVOID)
 	EnableWindow(hEditCallCount, TRUE);
 	EnableWindow(hEditResult, TRUE);
 	EnableWindow(hCheckExeOnly, TRUE);
+	EnableWindow(hCheckFastMode, TRUE);
 	UpdateWindow(g_hwndDlg);
 
 	return 0;
@@ -205,7 +275,9 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 		hEditCallCount = GetDlgItem(hwndDlg, IDC_EDIT1);
 		hEditResult = GetDlgItem(hwndDlg, IDC_EDIT2);
 		hCheckExeOnly = GetDlgItem(hwndDlg, IDC_CHECK1);
+		hCheckFastMode = GetDlgItem(hwndDlg, IDC_CHECK2);
 		Button_SetCheck(hCheckExeOnly, BST_CHECKED); // only scan exe by default
+		Button_SetCheck(hCheckFastMode, BST_CHECKED); // fast mode default
 
 		return TRUE;
 	case WM_COMMAND:
@@ -233,7 +305,9 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 					}
 					else
 					{
-						g_functionCallCount[bplist.bp[i].addr] = -1; // -1 means this function we dont interest in
+						// this function we don't interest in
+						DeleteBreakpoint(bplist.bp[i].addr);
+						g_functionCallCount.erase(bplist.bp[i].addr);
 					}
 				}
 				BridgeFree(bplist.bp);
@@ -271,8 +345,6 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 
 			SetWindowTextA(hEditResult, "");
 
-			FindAllUserFunctions();
-
 			Cmd("bc");
 
 			EnableWindow(hButtonSearch, FALSE);
@@ -281,6 +353,8 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 			EnableWindow(hEditCallCount, FALSE);
 			EnableWindow(hEditResult, FALSE);
 			EnableWindow(hCheckExeOnly, FALSE);
+			EnableWindow(hCheckFastMode, FALSE);
+			UpdateWindow(g_hwndDlg);
 			CloseHandle(CreateThread(0, 0, SettingBreakPointThread, 0, 0, 0));
 		}
 		else if (LOWORD(wParam) == IDC_BUTTON3)
@@ -312,7 +386,18 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 				g_scanExeOnly = false;
 			}
 		}
-		break;
+		else if (LOWORD(wParam) == IDC_CHECK2)
+		{
+			if (IsDlgButtonChecked(hwndDlg, IDC_CHECK2))
+			{
+				g_fastMode = true;
+			}
+			else
+			{
+				g_fastMode = false;
+			}
+		}
+		return TRUE;
 	case WM_CLOSE:
 		ShowWindow(hwndDlg, SW_HIDE);
 		return TRUE;
@@ -323,10 +408,29 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 //Do GUI/Menu related things here.
 void pluginSetup()
 {
-
-
 	_plugin_menuaddentry(g_hMenu, MENU_MAINWINDOW_POPUP, "Call Finder");
-	//_plugin_menuaddentry(g_hMenu, MENU_ABOUT_POPUP, "About");
+
+	// create a infinity thread, disable uninsterest breakpoints
+	new std::thread(([&]() {
+		while (1)
+		{
+			BPMAP bplist;
+			int bpCnt = DbgGetBpList(bp_normal, &bplist);
+			if (bpCnt)
+			{
+				for (int i = 0; i < bpCnt; i++)
+				{
+					if (bplist.bp[i].hitCount > 100)
+					{
+						DeleteBreakpoint(bplist.bp[i].addr);
+						g_functionCallCount.erase(bplist.bp[i].addr);
+					}
+				}
+				BridgeFree(bplist.bp);
+			}
+			Sleep(3000);
+		}
+	}));
 }
 
 //Deinitialize your plugin data here.
@@ -351,11 +455,7 @@ extern "C" __declspec(dllexport) void CBMENUENTRY(CBTYPE cbType, PLUG_CB_MENUENT
 	case MENU_MAINWINDOW_POPUP:
 		ShowWindow(g_pluginDlg, IsWindowVisible(g_pluginDlg) ? SW_HIDE : SW_SHOW);
 		break;
-	//case MENU_ABOUT_POPUP:
-	//	MessageBoxA(0, "author: ", "About", MB_OK);
-	//	break;
 	}
-	
 }
 
 
