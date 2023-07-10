@@ -11,40 +11,40 @@ using namespace Script::Register;
 
 
 void SystemBreakpointCallback(CBTYPE bType, void*callbackInfo);
-void DetachCallback(CBTYPE bType, void*callbackInfo);
-void AttachCallback(CBTYPE bType, void*callbackInfo);
-void BreakPointCallback(CBTYPE bType, void*callbackInfo);
+void BpCallback(CBTYPE bType, void*callbackInfo);
 
-std::map<duint, int> g_functionCallCount;
+std::map<duint, bool> g_breakpoints;
 
-duint g_oep = 0;
 bool g_scanExeOnly = true; // only scan exe by default
 bool g_fastMode = true;
+
+HWND g_pluginDlg = 0;
+HWND hButtonSearch;
+HWND hButtonReset;
+HWND hButtonNewSearch;
+HWND hEditCallCount;
+HWND hEditResult;
+HWND hCheckExeOnly;
+HWND hCheckFastMode;
 
 //Initialize your plugin data here.
 bool pluginInit(PLUG_INITSTRUCT* initStruct)
 {
-	Cmd("cleardb");
 	_plugin_registercallback(g_pluginHandle, CB_SYSTEMBREAKPOINT, SystemBreakpointCallback);
-	_plugin_registercallback(g_pluginHandle, CB_DETACH, DetachCallback);
-	_plugin_registercallback(g_pluginHandle, CB_DETACH, AttachCallback);
-	_plugin_registercallback(g_pluginHandle, CB_BREAKPOINT, BreakPointCallback);
+	_plugin_registercallback(g_pluginHandle, CB_BREAKPOINT, BpCallback);
 
 	return true; //Return false to cancel loading the plugin.
 }
 
-void DisableLogAndUi()
+// disable ui before set breakpoint, otherwise it will cause the UI to block
+void DisableUi()
 {
-	Cmd("LogDisable");
 	GuiUpdateDisable();
-	GuiDisableLog();
 }
 
-void EnableLogAndUi()
+void EnableUi()
 {
-	Cmd("LogEnable");
 	GuiUpdateEnable(true);
-	GuiEnableLog();
 }
 
 void SetBreakPointNotBreak(duint addr)
@@ -58,20 +58,67 @@ void SetBreakPointNotBreak(duint addr)
 	Cmd(cmd);
 }
 
-bool IsInstructionContains(duint addr, LPCSTR keyword)
+bool IsBadInstruction(duint addr)
 {
 	constexpr int cmdSize = 0x100;
 	char cmd[cmdSize];
-	sprintf_s(cmd, cmdSize, "strstr(dis.text(%p), \"%s\")", (PVOID)addr, keyword);
+	sprintf_s(cmd, cmdSize, "dis.next(dis.prev(%p)) != %p", (PVOID)addr, (PVOID)addr);
 	return DbgEval(cmd) ? true : false;
 }
 
-bool IsInstructionUnusual(duint addr)
+std::string DisasmAddress(duint addr)
 {
+	DISASM_INSTR di;
+	DbgDisasmAt((duint)addr, &di);
+	return di.instruction;
+}
+
+bool IsInstructionContains(duint addr, LPCSTR keyword)
+{
+	if (IsBadInstruction(addr))
+		return false;
+
+	std::string ins = DisasmAddress(addr);
+	if (ins.find(keyword) != std::string::npos) {
+		return true;
+	}
+	return false;
+}
+
+duint NextInstruct(duint addr)
+{
+	if (IsBadInstruction(addr))
+		return addr + 1;
+
 	constexpr int cmdSize = 0x100;
 	char cmd[cmdSize];
-	sprintf_s(cmd, cmdSize, "dis.isunusual(%p)", (PVOID)addr);
-	return DbgEval(cmd) ? true : false;
+	sprintf_s(cmd, cmdSize, "dis.next(%p)", (PVOID)addr);
+	return DbgEval(cmd);
+}
+
+void DeleteBreakpointsExceptOEP()
+{
+	DisableUi();
+	
+	ModuleInfo mainModuleInfo;
+	Script::Module::GetMainModuleInfo(&mainModuleInfo);
+	duint oep = mainModuleInfo.entry;
+
+	BPMAP bplist;
+	int bpCnt = DbgGetBpList(bp_normal, &bplist);
+	if (bpCnt)
+	{
+		for (int i = 0; i < bpCnt; i++)
+		{
+			if (bplist.bp[i].addr != oep)
+			{
+				Script::Debug::DeleteBreakpoint(bplist.bp[i].addr);
+			}
+		}
+		BridgeFree(bplist.bp);
+	}
+
+	EnableUi();
 }
 
 // find all user defined functions in secific module, return number of functions found
@@ -84,26 +131,44 @@ int ScanFunctionOnModule(duint base, duint size)
 	duint addr = startAddress;
 	addr = PAGE_ALIGN(addr);
 
-	size_t originCnt = g_functionCallCount.size();
+	size_t originCnt = g_breakpoints.size();
+
+	duint unCheckedPage = base;
+
+	int totalFound = 0;
+
+	Script::Module::ModuleInfo mInfo;
+	Script::Module::InfoFromAddr(base, &mInfo);
 
 	while (addr < endAddress)
 	{
-		// if not code, then skip this page
-		if (((ULONG_PTR)addr == PAGE_ALIGN(addr)))
+		// scanning new page, check if it's code
+		if ((unCheckedPage == PAGE_ALIGN(addr)))
 		{
-			sprintf_s(cmd, cmdSize, "mem.iscode(%p)", (PVOID)addr);
-			if (!DbgEval(cmd))
+			sprintf_s(cmd, cmdSize, "mem.iscode(%p)", (PVOID)unCheckedPage);
+			if (DbgEval(cmd))
 			{
-				addr = addr + PAGE_SIZE;
-				continue;
+				// new page is code
+				unCheckedPage += PAGE_SIZE;
+			}
+			else
+			{
+				// new page is not code
+				addr = PAGE_ALIGN(addr) + PAGE_SIZE;
+				unCheckedPage += PAGE_SIZE;
 			}
 		}
 
-		// is call ?
+		if (IsBadInstruction(addr))
+		{
+			addr++;
+			continue;
+		}
+
 		sprintf_s(cmd, cmdSize, "dis.iscall(%p)", (PVOID)addr);
 		if (DbgEval(cmd))
 		{
-			// try to eval dst address
+			// addr is call, try to eval dst address
 			DISASM_INSTR di;
 			DbgDisasmAt((duint)addr, &di);
 			duint FuncAddr = di.arg[0].value;
@@ -114,7 +179,11 @@ int ScanFunctionOnModule(duint base, duint size)
 			{
 				if (!g_fastMode)
 				{
-					g_functionCallCount[FuncAddr] = 0;
+					if (g_breakpoints.count(FuncAddr) == 0)
+					{
+						g_breakpoints[FuncAddr] = true;
+						totalFound++;
+					}
 				}
 				else
 				{
@@ -126,7 +195,11 @@ int ScanFunctionOnModule(duint base, duint size)
 						IsInstructionContains(FuncAddr, "cmp ") ||
 						IsInstructionContains(FuncAddr, "xor "))
 					{
-						g_functionCallCount[FuncAddr] = 0;
+						if (g_breakpoints.count(FuncAddr) == 0)
+						{
+							g_breakpoints[FuncAddr] = true;
+							totalFound++;
+						}
 					}
 				}
 			}
@@ -139,29 +212,40 @@ int ScanFunctionOnModule(duint base, duint size)
 					sprintf_s(cmd, cmdSize, "dis.imm(%p) != 0 && !mem.iscode(dis.imm(%p))", (PVOID)addr, (PVOID)addr);
 					if (DbgEval(cmd))
 					{
-						// invalid instruction
+						// invalid call instruction
 					}
 					else
 					{
-						sprintf_s(cmd, cmdSize, "dis.next(dis.prev(%p)) == %p", (PVOID)addr, (PVOID)addr);
-						if (DbgEval(cmd))
+						if (!IsBadInstruction(addr))
 						{
-							g_functionCallCount[addr] = 0;
+							if (g_breakpoints.count(addr) == 0)
+							{
+								g_breakpoints[addr] = true;
+								totalFound++;
+							}
 						}
 					}
 				}
 			}
 		}
 
+		if ((totalFound % 100) == 0)
+		{
+			char msg[0x100] = { 0 };
+			sprintf_s(msg, 0x100, "%d functions found in %s", totalFound, mInfo.name);
+			SetWindowTextA(hEditResult, msg);
+		}
+
+		//addr = NextInstruct(addr);
 		addr++;
 	}
-	return int(g_functionCallCount.size() - originCnt);
+	return int(g_breakpoints.size() - originCnt);
 }
 
 // find all user functions, store in global map
 void FindAllUserFunctions()
 {
-	g_functionCallCount.clear();
+	g_breakpoints.clear();
 
 	constexpr int cmdSize = 0x100;
 	char cmd[cmdSize] = { 0 };
@@ -198,57 +282,56 @@ void FindAllUserFunctions()
 
 void SystemBreakpointCallback(CBTYPE bType, void*callbackInfo)
 {
-	g_oep = 0;
-
-	Cmd("bc");
-
-	EnableLogAndUi();
+	DeleteBreakpointsExceptOEP();
 }
 
-void BreakPointCallback(CBTYPE bType, void*callbackInfo)
+void BpCallback(CBTYPE bType, void*callbackInfo)
 {
+	PLUG_CB_BREAKPOINT *info = (PLUG_CB_BREAKPOINT*)callbackInfo;
+	if (info->breakpoint->hitCount > 64)
+	{
+		info->breakpoint->active = false;
+		DeleteBreakpoint(info->breakpoint->addr);
+		g_breakpoints.erase(info->breakpoint->addr);
+		if (GuiIsUpdateDisabled())
+			GuiUpdateEnable(true);
+		UpdateWindow(GuiGetWindowHandle());
+		
+		char msg[0x100] = { 0 };
+		sprintf_s(msg, 0x100, "auto remove breakpoint %p", (PVOID)info->breakpoint->addr);
+		SetWindowTextA(hEditResult, msg);
+		UpdateWindow(g_hwndDlg);
+	}
+	
 }
 
-void DetachCallback(CBTYPE bType, void*callbackInfo)
-{
-	Cmd("bc");
-
-	EnableLogAndUi();
-}
-
-void AttachCallback(CBTYPE bType, void*callbackInfo)
-{
-	Cmd("bc");
-
-	EnableLogAndUi();
-}
-
-HWND g_pluginDlg = 0;
-HWND hButtonSearch;
-HWND hButtonReset;
-HWND hButtonNewSearch;
-HWND hEditCallCount;
-HWND hEditResult;
-HWND hCheckExeOnly;
-HWND hCheckFastMode;
-
-DWORD WINAPI SettingBreakPointThread(LPVOID)
+unsigned __stdcall SettingBreakPointThread(void*)
 {
 	FindAllUserFunctions();
 
 	SetWindowTextA(hEditResult, "setting break point...");
 
-	DisableLogAndUi();
-	for (auto &item : g_functionCallCount)
+	size_t total = g_breakpoints.size();
+	size_t current = 0;
+
+	DisableUi();
+	for (auto &item : g_breakpoints)
 	{
 		duint addr = item.first;
 		SetBreakPointNotBreak(addr);
+		if ((current % 100) == 0)
+		{
+			char msg[0x100] = { 0 };
+			sprintf_s(msg, 0x100, "%Id / %Id", current, total);
+			SetWindowTextA(hEditResult, msg);
+		}
+		current++;
 	}
-	EnableLogAndUi();
+	EnableUi();
 
 	constexpr int outputSize = 0x100;
 	char output[outputSize] = { 0 };
-	sprintf_s(output, outputSize, "%Id user functions found\r\nsetting break points may block x64dbg window for a while\r\nstart record!\r\nclick new search button to reset call count", g_functionCallCount.size());
+	sprintf_s(output, outputSize, "%Id user functions found\r\nsetting break points may block x64dbg window for a while\r\nstart record!\r\nclick new search button to reset call count", g_breakpoints.size());
 	SetWindowTextA(hEditResult, output);
 
 	EnableWindow(hButtonSearch, TRUE);
@@ -285,49 +368,52 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 		{
 			// search button click
 
+			// remove uninteresting breakpoints
+
 			char buffer[256];
 			GetWindowTextA(GetDlgItem(hwndDlg, IDC_EDIT1), buffer, 256);
 			int count = 0;
 			sscanf_s(buffer, "%d", &count);
 			dprintf("searching functions of hit count %d\n", count);
 
-			std::vector<duint> functionsLeft;
+			std::vector<duint> bpToDelete;
 			BPMAP bplist;
 			int bpCnt = DbgGetBpList(bp_normal, &bplist);
 			if (bpCnt)
 			{
 				for (int i = 0; i < bpCnt; i++)
 				{
-					if (bplist.bp[i].hitCount == count)
+					if (bplist.bp[i].hitCount != count)
 					{
-						g_functionCallCount[bplist.bp[i].addr] = bplist.bp[i].hitCount;
-						functionsLeft.push_back(bplist.bp[i].addr);
-					}
-					else
-					{
-						// this function we don't interest in
-						DeleteBreakpoint(bplist.bp[i].addr);
-						g_functionCallCount.erase(bplist.bp[i].addr);
+						bpToDelete.push_back(bplist.bp[i].addr);
 					}
 				}
 				BridgeFree(bplist.bp);
 			}
-			SetWindowTextA(hEditResult, "");
-			if (functionsLeft.size() > 100)
+			
+			DisableUi();
+			for (auto &bp : bpToDelete)
+			{
+				DeleteBreakpoint(bp);
+				g_breakpoints.erase(bp);
+			}
+			EnableUi();
+
+			if (g_breakpoints.size() > 100)
 			{
 				constexpr int bufferSize = 0x100;
-				sprintf_s(buffer, bufferSize, "%Id functions left\r\ntoo many function found, result will not show", functionsLeft.size());
+				sprintf_s(buffer, bufferSize, "%Id functions left\r\ntoo many function found, result will not show", g_breakpoints.size());
 				SetWindowTextA(hEditResult, buffer);
 			}
 			else
 			{
 				std::string output;
-				output = std::to_string(functionsLeft.size()) + " functions left\r\n";
-				for (auto &item : functionsLeft)
+				output = std::to_string(g_breakpoints.size()) + " functions left\r\n";
+				for (auto &item : g_breakpoints)
 				{
-					dprintf("%p\n", (PVOID)item);
+					dprintf("%p\n", (PVOID)item.first);
 					std::stringstream stream;
-					stream << std::hex << (PVOID)item;
+					stream << std::hex << (PVOID)item.first;
 					std::string hexStrAddr(stream.str());
 					output += hexStrAddr;
 					output += "\r\n";
@@ -343,10 +429,8 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 
 			// find all functions in main modules, reset call count, and set condition break point to start record
 
-			SetWindowTextA(hEditResult, "");
-
-			Cmd("bc");
-
+			SetWindowTextA(hEditResult, "scanning...");
+			
 			EnableWindow(hButtonSearch, FALSE);
 			EnableWindow(hButtonReset, FALSE);
 			EnableWindow(hButtonNewSearch, FALSE);
@@ -355,7 +439,9 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 			EnableWindow(hCheckExeOnly, FALSE);
 			EnableWindow(hCheckFastMode, FALSE);
 			UpdateWindow(g_hwndDlg);
-			CloseHandle(CreateThread(0, 0, SettingBreakPointThread, 0, 0, 0));
+
+			DeleteBreakpointsExceptOEP();
+			CloseHandle((HANDLE)_beginthreadex(0, 0, SettingBreakPointThread, 0, 0, 0));
 		}
 		else if (LOWORD(wParam) == IDC_BUTTON3)
 		{
@@ -365,13 +451,12 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 			constexpr int cmdSize = 0x100;
 			char cmd[cmdSize];
 			int cnt = 0;
-			for (auto &item : g_functionCallCount)
+			for (auto &item : g_breakpoints)
 			{
 				sprintf_s(cmd, cmdSize, "ResetBreakpointHitCount %p", (PVOID)item.first);
 				Cmd(cmd);
-				item.second = 0;
 			}
-			dprintf("all %d functions call count reset\n", g_functionCallCount.size());
+			dprintf("all %d functions call count reset\n", g_breakpoints.size());
 		}
 		else if (LOWORD(wParam) == IDC_CHECK1)
 		{
@@ -409,28 +494,6 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 void pluginSetup()
 {
 	_plugin_menuaddentry(g_hMenu, MENU_MAINWINDOW_POPUP, "Call Finder");
-
-	// create a infinity thread, disable uninsterest breakpoints
-	new std::thread(([&]() {
-		while (1)
-		{
-			BPMAP bplist;
-			int bpCnt = DbgGetBpList(bp_normal, &bplist);
-			if (bpCnt)
-			{
-				for (int i = 0; i < bpCnt; i++)
-				{
-					if (bplist.bp[i].hitCount > 100)
-					{
-						DeleteBreakpoint(bplist.bp[i].addr);
-						g_functionCallCount.erase(bplist.bp[i].addr);
-					}
-				}
-				BridgeFree(bplist.bp);
-			}
-			Sleep(3000);
-		}
-	}));
 }
 
 //Deinitialize your plugin data here.

@@ -14,6 +14,7 @@
 #include <psapi.h>
 #include <sstream>
 #include <windowsx.h>
+#include <process.h>
 
 //#include "TitanEngine/TitanEngine.h"
 
