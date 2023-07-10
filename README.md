@@ -40,7 +40,13 @@ Search all user functions, and set a conditional breakpoint, the number of funct
 
 ## TODO
 
-- maybe set breakpoint at call instruction rather than call destination
+- Too many breakpoints cause the debugger to freeze
+
+## See also
+
+cheat engine code filter:
+
+https://www.youtube.com/watch?v=csrU18C4rWY
 
 ## License
 
