@@ -9,14 +9,92 @@ using namespace Script::Symbol;
 using namespace Script::Debug;
 using namespace Script::Register;
 
+// Delaying execution when setting breakpoints can reduce the probability of UI blocking
+#define DELAY_MAGIC() Sleep(50)
 
-void SystemBreakpointCallback(CBTYPE bType, void*callbackInfo);
-void BpCallback(CBTYPE bType, void*callbackInfo);
+class BreakPointManager
+{
+private:
+	std::map<duint, bool> breakpoints;
 
-std::map<duint, bool> g_breakpoints;
+public:
 
-bool g_scanExeOnly = true; // only scan exe by default
-bool g_fastMode = true;
+	~BreakPointManager()
+	{
+		Clear();
+	}
+
+	void Clear()
+	{
+		for (auto &item : breakpoints)
+		{
+			RemoveBreakPoint(item.first);
+		}
+	}
+
+	void SetBreakPoint(duint addr)
+	{
+		if (breakpoints.find(addr) != breakpoints.end())
+		{
+			return;
+		}
+
+		constexpr int cmdSize = 0x100;
+		char cmd[cmdSize];
+
+		sprintf_s(cmd, cmdSize, "bp %p", (PVOID)addr);
+		Cmd(cmd);
+		sprintf_s(cmd, cmdSize, "bpcnd %p,\"0\"", (PVOID)addr); // break if 0
+		Cmd(cmd);
+
+		breakpoints[addr] = true;
+
+		DELAY_MAGIC();
+	}
+
+	void RemoveBreakPoint(duint addr)
+	{
+		Script::Debug::DeleteBreakpoint(addr);
+
+		breakpoints.erase(addr);
+	}
+
+	std::vector<duint> FilterBreakPointsWithCallCount(duint count)
+	{
+		std::vector<duint> bps;
+
+		BPMAP bplist;
+		int bpCnt = DbgGetBpList(bp_normal, &bplist);
+		if (bpCnt)
+		{
+			for (int i = 0; i < bpCnt; i++)
+			{
+				// only handle our breakpoints
+				if (breakpoints.find(bplist.bp[i].addr) != breakpoints.end())
+				{
+					if (bplist.bp[i].hitCount == count)
+					{
+						bps.push_back(bplist.bp[i].addr);
+					}
+					else
+					{
+						RemoveBreakPoint(bplist.bp[i].addr);
+					}
+				}
+			}
+			BridgeFree(bplist.bp);
+		}
+
+		return bps;
+	}
+
+	size_t GetBreakPointsCount()
+	{
+		return breakpoints.size();
+	}
+};
+
+BreakPointManager g_BreakpointsManager;
 
 HWND g_pluginDlg = 0;
 HWND hButtonSearch;
@@ -24,38 +102,21 @@ HWND hButtonReset;
 HWND hButtonNewSearch;
 HWND hEditCallCount;
 HWND hEditResult;
-HWND hCheckExeOnly;
-HWND hCheckFastMode;
+HWND hEditAddrStart;
+HWND hEditAddrEnd;
+
+void SystemBreakpointCallback(CBTYPE bType, void*callbackInfo);
 
 //Initialize your plugin data here.
 bool pluginInit(PLUG_INITSTRUCT* initStruct)
 {
 	_plugin_registercallback(g_pluginHandle, CB_SYSTEMBREAKPOINT, SystemBreakpointCallback);
-	_plugin_registercallback(g_pluginHandle, CB_BREAKPOINT, BpCallback);
-
 	return true; //Return false to cancel loading the plugin.
 }
 
-// disable ui before set breakpoint, otherwise it will cause the UI to block
-void DisableUi()
+void SystemBreakpointCallback(CBTYPE bType, void*callbackInfo)
 {
-	GuiUpdateDisable();
-}
-
-void EnableUi()
-{
-	GuiUpdateEnable(true);
-}
-
-void SetBreakPointNotBreak(duint addr)
-{
-	constexpr int cmdSize = 0x100;
-	char cmd[cmdSize];
-
-	sprintf_s(cmd, cmdSize, "bp %p", (PVOID)addr);
-	Cmd(cmd);
-	sprintf_s(cmd, cmdSize, "bpcnd %p,\"0\"", (PVOID)addr); // break if 0
-	Cmd(cmd);
+	g_BreakpointsManager.Clear();
 }
 
 bool IsBadInstruction(duint addr)
@@ -96,34 +157,11 @@ duint NextInstruct(duint addr)
 	return DbgEval(cmd);
 }
 
-void DeleteBreakpointsExceptOEP()
+// find all user defined functions in secific address range, and then set breakpoints
+size_t ScanFunctionsAndSetBreakPoints(duint base, duint size)
 {
-	DisableUi();
-	
-	ModuleInfo mainModuleInfo;
-	Script::Module::GetMainModuleInfo(&mainModuleInfo);
-	duint oep = mainModuleInfo.entry;
+	g_BreakpointsManager.Clear();
 
-	BPMAP bplist;
-	int bpCnt = DbgGetBpList(bp_normal, &bplist);
-	if (bpCnt)
-	{
-		for (int i = 0; i < bpCnt; i++)
-		{
-			if (bplist.bp[i].addr != oep)
-			{
-				Script::Debug::DeleteBreakpoint(bplist.bp[i].addr);
-			}
-		}
-		BridgeFree(bplist.bp);
-	}
-
-	EnableUi();
-}
-
-// find all user defined functions in secific module, return number of functions found
-int ScanFunctionOnModule(duint base, duint size)
-{
 	constexpr int cmdSize = 0x100;
 	char cmd[cmdSize] = { 0 };
 	duint startAddress = base;
@@ -131,11 +169,7 @@ int ScanFunctionOnModule(duint base, duint size)
 	duint addr = startAddress;
 	addr = PAGE_ALIGN(addr);
 
-	size_t originCnt = g_breakpoints.size();
-
 	duint unCheckedPage = base;
-
-	int totalFound = 0;
 
 	Script::Module::ModuleInfo mInfo;
 	Script::Module::InfoFromAddr(base, &mInfo);
@@ -177,30 +211,14 @@ int ScanFunctionOnModule(duint base, duint size)
 			sprintf_s(cmd, cmdSize, "mem.iscode(%p) && mod.user(%p)", (PVOID)FuncAddr, (PVOID)FuncAddr);
 			if (DbgEval(cmd))
 			{
-				if (!g_fastMode)
+				if (IsInstructionContains(FuncAddr, "mov ") ||
+					IsInstructionContains(FuncAddr, "push ") ||
+					IsInstructionContains(FuncAddr, "sub ") ||
+					IsInstructionContains(FuncAddr, "lea ") ||
+					IsInstructionContains(FuncAddr, "cmp ") ||
+					IsInstructionContains(FuncAddr, "xor "))
 				{
-					if (g_breakpoints.count(FuncAddr) == 0)
-					{
-						g_breakpoints[FuncAddr] = true;
-						totalFound++;
-					}
-				}
-				else
-				{
-					// fast mode does more checks because we want to minimize the number of breakpoints
-					if (IsInstructionContains(FuncAddr, "mov ") ||
-						IsInstructionContains(FuncAddr, "push ") ||
-						IsInstructionContains(FuncAddr, "sub ") ||
-						IsInstructionContains(FuncAddr, "lea ") ||
-						IsInstructionContains(FuncAddr, "cmp ") ||
-						IsInstructionContains(FuncAddr, "xor "))
-					{
-						if (g_breakpoints.count(FuncAddr) == 0)
-						{
-							g_breakpoints[FuncAddr] = true;
-							totalFound++;
-						}
-					}
+					g_BreakpointsManager.SetBreakPoint(FuncAddr);
 				}
 			}
 			else
@@ -218,132 +236,84 @@ int ScanFunctionOnModule(duint base, duint size)
 					{
 						if (!IsBadInstruction(addr))
 						{
-							if (g_breakpoints.count(addr) == 0)
-							{
-								g_breakpoints[addr] = true;
-								totalFound++;
-							}
+							g_BreakpointsManager.SetBreakPoint(addr);
 						}
 					}
 				}
 			}
 		}
 
-		if ((totalFound % 100) == 0)
-		{
-			char msg[0x100] = { 0 };
-			sprintf_s(msg, 0x100, "%d functions found in %s", totalFound, mInfo.name);
-			SetWindowTextA(hEditResult, msg);
-		}
-
 		//addr = NextInstruct(addr);
 		addr++;
 	}
-	return int(g_breakpoints.size() - originCnt);
+
+	return g_BreakpointsManager.GetBreakPointsCount();
 }
 
-// find all user functions, store in global map
-void FindAllUserFunctions()
+INT_PTR CALLBACK PickDllDialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
-	g_breakpoints.clear();
+	static std::vector<ModuleInfo> *dlls = nullptr;
 
-	constexpr int cmdSize = 0x100;
-	char cmd[cmdSize] = { 0 };
+	switch (uMsg)
+	{
+	case WM_INITDIALOG:
+	{
+		dlls = new std::vector<ModuleInfo>;
+		HWND hwndList = GetDlgItem(hwndDlg, IDC_LIST_DLL);
 
-	// only scan main module
-	if (g_scanExeOnly)
-	{
-		ModuleInfo mainModuleInfo;
-		Script::Module::GetMainModuleInfo(&mainModuleInfo);
-		int funcCnt = ScanFunctionOnModule(mainModuleInfo.base, mainModuleInfo.size);
-		dprintf("%d functions found in %s\n", funcCnt, mainModuleInfo.name);
-		return;
-	}
-	
-	// get all user modules, exe and dll
-	ListInfo listInfo;
-	if (Script::Module::GetList(&listInfo))
-	{
-		for (int i = 0; i < listInfo.count; i++)
+		// receive all dlls
+		ListInfo listInfo;
+		if (Script::Module::GetList(&listInfo))
 		{
-			ModuleInfo *mInfo = &((ModuleInfo *)listInfo.data)[i];
-			
-			sprintf_s(cmd, cmdSize, "mod.user(%p)", (PVOID)mInfo->base);
-			if (DbgEval(cmd))
+			for (int i = 0; i < listInfo.count; i++)
 			{
-				// scan functions in module
-				int funcCnt = ScanFunctionOnModule(mInfo->base, mInfo->size);
-				dprintf("%d functions found in %s\n", funcCnt, mInfo->name);
+				ModuleInfo *mInfo = &((ModuleInfo *)listInfo.data)[i];
+				dlls->push_back(*mInfo);
+			}
+			BridgeFree(listInfo.data);
+		}
+
+		std::sort(dlls->begin(), dlls->end(), [](const ModuleInfo &m1, const ModuleInfo &m2) {
+			
+			return m1.base < m2.base;
+		});
+
+		for (size_t i = 0; i < dlls->size(); i++)
+		{
+			// add to list box
+			int pos = (int)SendMessageA(hwndList, LB_INSERTSTRING, i,
+				(LPARAM)dlls->at(i).name);
+		}
+		SetFocus(hwndList);
+		break;
+	}
+	case WM_CLOSE: 
+	{
+		delete dlls;
+		EndDialog(hwndDlg, 0);
+		return TRUE;
+	}
+	case WM_COMMAND:
+		if (LOWORD(wParam) == IDC_BUTTON_PICK_DLL)
+		{
+			HWND hwndList = GetDlgItem(hwndDlg, IDC_LIST_DLL);
+
+			// Get selected index.
+			int i = (int)SendMessage(hwndList, LB_GETCURSEL, 0, 0);
+			if (i >= 0 && (size_t)i < dlls->size())
+			{
+				char buf[0x100];
+				sprintf_s(buf, _countof(buf), "%p", (PVOID)dlls->at(i).base);
+				SetWindowTextA(hEditAddrStart, buf);
+				sprintf_s(buf, _countof(buf), "%p", (PVOID)(dlls->at(i).base + dlls->at(i).size));
+				SetWindowTextA(hEditAddrEnd, buf);
+
+				SendMessageA(hwndDlg, WM_CLOSE, 0, 0);
 			}
 		}
-		BridgeFree(listInfo.data);
+		return TRUE;
 	}
-}
-
-void SystemBreakpointCallback(CBTYPE bType, void*callbackInfo)
-{
-	DeleteBreakpointsExceptOEP();
-}
-
-void BpCallback(CBTYPE bType, void*callbackInfo)
-{
-	PLUG_CB_BREAKPOINT *info = (PLUG_CB_BREAKPOINT*)callbackInfo;
-	if (info->breakpoint->hitCount > 64)
-	{
-		info->breakpoint->active = false;
-		DeleteBreakpoint(info->breakpoint->addr);
-		g_breakpoints.erase(info->breakpoint->addr);
-		if (GuiIsUpdateDisabled())
-			GuiUpdateEnable(true);
-		UpdateWindow(GuiGetWindowHandle());
-		
-		char msg[0x100] = { 0 };
-		sprintf_s(msg, 0x100, "auto remove breakpoint %p", (PVOID)info->breakpoint->addr);
-		SetWindowTextA(hEditResult, msg);
-		UpdateWindow(g_hwndDlg);
-	}
-	
-}
-
-unsigned __stdcall SettingBreakPointThread(void*)
-{
-	FindAllUserFunctions();
-
-	SetWindowTextA(hEditResult, "setting break point...");
-
-	size_t total = g_breakpoints.size();
-	size_t current = 0;
-
-	DisableUi();
-	for (auto &item : g_breakpoints)
-	{
-		duint addr = item.first;
-		SetBreakPointNotBreak(addr);
-		if ((current % 100) == 0)
-		{
-			char msg[0x100] = { 0 };
-			sprintf_s(msg, 0x100, "%Id / %Id", current, total);
-			SetWindowTextA(hEditResult, msg);
-		}
-		current++;
-	}
-	EnableUi();
-
-	constexpr int outputSize = 0x100;
-	char output[outputSize] = { 0 };
-	sprintf_s(output, outputSize, "%Id user functions found\r\nsetting break points may block x64dbg window for a while\r\nstart record!\r\nclick new search button to reset call count", g_breakpoints.size());
-	SetWindowTextA(hEditResult, output);
-
-	EnableWindow(hButtonSearch, TRUE);
-	EnableWindow(hButtonReset, TRUE);
-	EnableWindow(hButtonNewSearch, TRUE);
-	EnableWindow(hEditCallCount, TRUE);
-	EnableWindow(hEditResult, TRUE);
-	EnableWindow(hCheckExeOnly, TRUE);
-	EnableWindow(hCheckFastMode, TRUE);
-	UpdateWindow(g_hwndDlg);
-
-	return 0;
+	return FALSE;
 }
 
 INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
@@ -357,18 +327,19 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 		hButtonNewSearch = GetDlgItem(hwndDlg, IDC_BUTTON3);
 		hEditCallCount = GetDlgItem(hwndDlg, IDC_EDIT1);
 		hEditResult = GetDlgItem(hwndDlg, IDC_EDIT2);
-		hCheckExeOnly = GetDlgItem(hwndDlg, IDC_CHECK1);
-		hCheckFastMode = GetDlgItem(hwndDlg, IDC_CHECK2);
-		Button_SetCheck(hCheckExeOnly, BST_CHECKED); // only scan exe by default
-		Button_SetCheck(hCheckFastMode, BST_CHECKED); // fast mode default
+		hEditAddrStart = GetDlgItem(hwndDlg, IDC_EDIT_ADDR_START);
+		hEditAddrEnd = GetDlgItem(hwndDlg, IDC_EDIT_ADDR_END);
 
 		return TRUE;
 	case WM_COMMAND:
 		if (LOWORD(wParam) == IDC_BUTTON1)
 		{
-			// search button click
+			/*
+			Search button click
 
-			// remove uninteresting breakpoints
+			Get the number of calls input by the user from the edit box, 
+			and then delete the breakpoints that do not meet the conditions
+			*/
 
 			char buffer[256];
 			GetWindowTextA(GetDlgItem(hwndDlg, IDC_EDIT1), buffer, 256);
@@ -376,58 +347,31 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 			sscanf_s(buffer, "%d", &count);
 			dprintf("searching functions of hit count %d\n", count);
 
-			std::vector<duint> bpToDelete;
-			BPMAP bplist;
-			int bpCnt = DbgGetBpList(bp_normal, &bplist);
-			if (bpCnt)
-			{
-				for (int i = 0; i < bpCnt; i++)
-				{
-					if (bplist.bp[i].hitCount != count)
-					{
-						bpToDelete.push_back(bplist.bp[i].addr);
-					}
-				}
-				BridgeFree(bplist.bp);
-			}
-			
-			DisableUi();
-			for (auto &bp : bpToDelete)
-			{
-				DeleteBreakpoint(bp);
-				g_breakpoints.erase(bp);
-			}
-			EnableUi();
+			std::vector<duint> breakpointsLeft = g_BreakpointsManager.FilterBreakPointsWithCallCount(count);
 
-			if (g_breakpoints.size() > 100)
+			std::string output;
+			output = std::to_string(breakpointsLeft.size()) + " functions left\r\n";
+			for (auto &item : breakpointsLeft)
 			{
-				constexpr int bufferSize = 0x100;
-				sprintf_s(buffer, bufferSize, "%Id functions left\r\ntoo many function found, result will not show", g_breakpoints.size());
-				SetWindowTextA(hEditResult, buffer);
-			}
-			else
-			{
-				std::string output;
-				output = std::to_string(g_breakpoints.size()) + " functions left\r\n";
-				for (auto &item : g_breakpoints)
-				{
-					dprintf("%p\n", (PVOID)item.first);
-					std::stringstream stream;
-					stream << std::hex << (PVOID)item.first;
-					std::string hexStrAddr(stream.str());
-					output += hexStrAddr;
-					output += "\r\n";
-					SetWindowTextA(hEditResult, output.c_str());
-				}
+				dprintf("%p\n", (PVOID)item);
+				std::stringstream stream;
+				stream << std::hex << (PVOID)item;
+				std::string hexStrAddr(stream.str());
+				output += hexStrAddr;
+				output += "\r\n";
+				SetWindowTextA(hEditResult, output.c_str());
 			}
 			
 			return TRUE;
 		}
 		else if (LOWORD(wParam) == IDC_BUTTON2)
 		{
-			// scan functions button click
+			/*
+			scan functions button click
 
-			// find all functions in main modules, reset call count, and set condition break point to start record
+			Get the user-specified address range from the edit box, 
+			scan the functions within the address range, and set conditional breakpoints
+			*/
 
 			SetWindowTextA(hEditResult, "scanning...");
 			
@@ -436,51 +380,31 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 			EnableWindow(hButtonNewSearch, FALSE);
 			EnableWindow(hEditCallCount, FALSE);
 			EnableWindow(hEditResult, FALSE);
-			EnableWindow(hCheckExeOnly, FALSE);
-			EnableWindow(hCheckFastMode, FALSE);
 			UpdateWindow(g_hwndDlg);
 
-			DeleteBreakpointsExceptOEP();
-			CloseHandle((HANDLE)_beginthreadex(0, 0, SettingBreakPointThread, 0, 0, 0));
-		}
-		else if (LOWORD(wParam) == IDC_BUTTON3)
-		{
-			// new search click
+			PVOID addrStart = NULL;
+			PVOID addrEnd = NULL;
+			char buffer[256];
+			GetWindowTextA(GetDlgItem(hwndDlg, IDC_EDIT_ADDR_START), buffer, 256);
+			sscanf_s(buffer, "%p", &addrStart);
+			GetWindowTextA(GetDlgItem(hwndDlg, IDC_EDIT_ADDR_END), buffer, 256);
+			sscanf_s(buffer, "%p", &addrEnd);
+			dprintf("scanning address range: %p -> %p\n", addrStart, addrEnd);
 
-			// reset hit count
-			constexpr int cmdSize = 0x100;
-			char cmd[cmdSize];
-			int cnt = 0;
-			for (auto &item : g_breakpoints)
-			{
-				sprintf_s(cmd, cmdSize, "ResetBreakpointHitCount %p", (PVOID)item.first);
-				Cmd(cmd);
-			}
-			dprintf("all %d functions call count reset\n", g_breakpoints.size());
-		}
-		else if (LOWORD(wParam) == IDC_CHECK1)
-		{
-			// "only exe functions" checkbox event
+			size_t cnt = ScanFunctionsAndSetBreakPoints((duint)addrStart, (duint)addrEnd - (duint)addrStart);
+			sprintf_s(buffer, _countof(buffer), "%Id breakpoints set", cnt);
+			SetWindowTextA(hEditResult, buffer);
 
-			if (IsDlgButtonChecked(hwndDlg, IDC_CHECK1))
-			{
-				g_scanExeOnly = true;
-			}
-			else
-			{
-				g_scanExeOnly = false;
-			}
+			EnableWindow(hButtonSearch, TRUE);
+			EnableWindow(hButtonReset, TRUE);
+			EnableWindow(hButtonNewSearch, TRUE);
+			EnableWindow(hEditCallCount, TRUE);
+			EnableWindow(hEditResult, TRUE);
+			UpdateWindow(g_hwndDlg);
 		}
-		else if (LOWORD(wParam) == IDC_CHECK2)
+		else if (LOWORD(wParam) == IDC_BUTTON_PICK)
 		{
-			if (IsDlgButtonChecked(hwndDlg, IDC_CHECK2))
-			{
-				g_fastMode = true;
-			}
-			else
-			{
-				g_fastMode = false;
-			}
+			DialogBoxA(g_hInstance, MAKEINTRESOURCEA(IDD_DIALOG2), hwndDlg, PickDllDialogProc);
 		}
 		return TRUE;
 	case WM_CLOSE:
