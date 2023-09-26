@@ -4,7 +4,7 @@ A x64dbg plugin for quickly locating key functions.
 
 English / [简体中文](./README_CN.md)
 
-![](images/2023-07-09-00-39-29.png)
+![](images/1.gif)
 
 ## Install
 
