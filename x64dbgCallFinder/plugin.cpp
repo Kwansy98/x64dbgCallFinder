@@ -268,16 +268,26 @@ size_t ScanFunctionsAndSetBreakPoints(duint base, duint size)
 
 					if (g_BreakpointsManager->GetBreakPointsCount() == MAX_BREAKPOINT_LIMIT)
 					{
-						char buf[64] = { 0 };
-						sprintf_s(buf, _countof(buf), "%p", (PVOID)callDst);
-						SetWindowTextA(hEditAddrStart, buf);
+						char userMessage[400] = { 0 };
+						sprintf_s(userMessage, _countof(userMessage),
+							"Setting a large number of breakpoints would cause x64dbg to block, "\
+							"so only %d breakpoints were set. The key function may not be among them. "\
+							"Clicking the \"Yes\" button will automatically set the last breakpoint to the new starting address. "\
+							"You can then scan the function again with the new starting address."\
+							"Or clicking the \"No\" button will not update the starting address.",
+							MAX_BREAKPOINT_LIMIT);
 
-						char buf2[400] = { 0 };
-						sprintf_s(buf2, _countof(buf2),
-							"Setting a large number of breakpoints in x64dbg will cause the debugger to block, so a limit on the number of breakpoints is set. The first %d breakpoints have been set. The starting address has been updated. If the target function is not among the first %d functions, you only need to click the \"scan\" button to rescan.",
-							MAX_BREAKPOINT_LIMIT, MAX_BREAKPOINT_LIMIT);
-
-						MessageBoxA(0, buf2, "", MB_OK);
+						int result = MessageBoxA(0, userMessage, "Automatically update the starting address?", MB_YESNO);
+						if (result == IDYES)
+						{
+							char newStartAddress[64] = { 0 };
+							sprintf_s(newStartAddress, _countof(newStartAddress), "%p", (PVOID)callDst);
+							SetWindowTextA(hEditAddrStart, newStartAddress);
+						}
+						else if (result == IDNO)
+						{
+							// ...
+						}
 						break;
 					}
 				}
