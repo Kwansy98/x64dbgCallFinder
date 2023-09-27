@@ -1,5 +1,11 @@
 #include "plugin.h"
 
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <Shlwapi.h>
+#pragma comment(lib,"Shlwapi.lib")
+
 #ifdef _UNICODE
 #error "USE ASCII CODE PAGE"
 #endif
@@ -9,24 +15,28 @@ using namespace Script::Symbol;
 using namespace Script::Debug;
 using namespace Script::Register;
 
+/*
+The maximum number of breakpoints allowed to be set. 
+Setting too many breakpoints at once can cause serious degradation in debugger performance.
+*/
+#define MAX_BREAKPOINT_LIMIT 500
 
 class BreakPointManager
 {
 private:
 	std::map<duint, bool> breakpoints;
-
 public:
-
 	~BreakPointManager()
 	{
 		Clear();
 	}
 
+	// remove all breakpoints
 	void Clear()
 	{
-		for (auto &item : breakpoints)
+		while (!breakpoints.empty())
 		{
-			RemoveBreakPoint(item.first);
+			RemoveBreakPoint((*breakpoints.begin()).first);
 		}
 	}
 
@@ -88,31 +98,57 @@ public:
 	{
 		return breakpoints.size();
 	}
+
+	bool IsBreakpoint(duint addr)
+	{
+		if (breakpoints.find(addr) != breakpoints.end())
+		{
+			return true;
+		}
+		return false;
+	}
 };
 
-BreakPointManager g_BreakpointsManager;
+// initialize in attach, destruct in dettach
+BreakPointManager *g_BreakpointsManager = nullptr;
 
 HWND g_pluginDlg = 0;
 HWND hButtonSearch;
-HWND hButtonReset;
-HWND hButtonNewSearch;
+HWND hButtonScan;
+HWND hButtonPick;
 HWND hEditCallCount;
 HWND hEditResult;
 HWND hEditAddrStart;
 HWND hEditAddrEnd;
 
-void SystemBreakpointCallback(CBTYPE bType, void*callbackInfo);
+void DestructBreakpointsManagerCallback(CBTYPE bType, void*callbackInfo)
+{
+	if (g_BreakpointsManager) 
+	{
+		g_BreakpointsManager->Clear();
+		delete g_BreakpointsManager;
+		g_BreakpointsManager = nullptr;
+	}
+}
+
+void InitBreakPointManagerCallback(CBTYPE bType, void*callbackInfo)
+{
+	if (g_BreakpointsManager == nullptr)
+	{
+		g_BreakpointsManager = new BreakPointManager;
+	}
+}
 
 //Initialize your plugin data here.
 bool pluginInit(PLUG_INITSTRUCT* initStruct)
 {
-	_plugin_registercallback(g_pluginHandle, CB_SYSTEMBREAKPOINT, SystemBreakpointCallback);
-	return true; //Return false to cancel loading the plugin.
-}
+	_plugin_registercallback(g_pluginHandle, CB_INITDEBUG, InitBreakPointManagerCallback);
+	_plugin_registercallback(g_pluginHandle, CB_STOPDEBUG, DestructBreakpointsManagerCallback);
+	_plugin_registercallback(g_pluginHandle, CB_ATTACH, InitBreakPointManagerCallback);
+	_plugin_registercallback(g_pluginHandle, CB_DETACH, DestructBreakpointsManagerCallback);
+	_plugin_registercallback(g_pluginHandle, CB_STOPPINGDEBUG, DestructBreakpointsManagerCallback);
 
-void SystemBreakpointCallback(CBTYPE bType, void*callbackInfo)
-{
-	g_BreakpointsManager.Clear();
+	return true; //Return false to cancel loading the plugin.
 }
 
 bool IsBadInstruction(duint addr)
@@ -142,6 +178,22 @@ bool IsInstructionContains(duint addr, LPCSTR keyword)
 	return false;
 }
 
+bool IsBranch(duint addr)
+{
+	constexpr int cmdSize = 0x100;
+	char cmd[cmdSize];
+	sprintf_s(cmd, cmdSize, "dis.isbranch(%p)", (PVOID)addr);
+	return DbgEval(cmd) ? true : false;
+}
+
+bool IsRet(duint addr)
+{
+	constexpr int cmdSize = 0x100;
+	char cmd[cmdSize];
+	sprintf_s(cmd, cmdSize, "dis.isret(%p)", (PVOID)addr);
+	return DbgEval(cmd) ? true : false;
+}
+
 duint NextInstruct(duint addr)
 {
 	if (IsBadInstruction(addr))
@@ -156,20 +208,17 @@ duint NextInstruct(duint addr)
 // find all user defined functions in secific address range, and then set breakpoints
 size_t ScanFunctionsAndSetBreakPoints(duint base, duint size)
 {
-	g_BreakpointsManager.Clear();
+	g_BreakpointsManager->Clear(); // Before rescanning the function, remove previously set breakpoints
 
 	constexpr int cmdSize = 0x100;
 	char cmd[cmdSize] = { 0 };
 	duint startAddress = base;
 	duint endAddress = base + size;
 	duint addr = startAddress;
-	addr = PAGE_ALIGN(addr);
 
 	duint unCheckedPage = base;
-
-	Script::Module::ModuleInfo mInfo;
-	Script::Module::InfoFromAddr(base, &mInfo);
-
+	
+	// find functions
 	while (addr < endAddress)
 	{
 		// scanning new page, check if it's code
@@ -201,39 +250,35 @@ size_t ScanFunctionsAndSetBreakPoints(duint base, duint size)
 			// addr is call, try to eval dst address
 			DISASM_INSTR di;
 			DbgDisasmAt((duint)addr, &di);
-			duint FuncAddr = di.arg[0].value;
+			duint callDst = di.arg[0].value;
 			
 			// is dst a user function ?
-			sprintf_s(cmd, cmdSize, "mem.iscode(%p) && mod.user(%p)", (PVOID)FuncAddr, (PVOID)FuncAddr);
+			sprintf_s(cmd, cmdSize, "mem.iscode(%p) && mod.user(%p)", (PVOID)callDst, (PVOID)callDst);
 			if (DbgEval(cmd))
 			{
-				if (IsInstructionContains(FuncAddr, "mov ") ||
-					IsInstructionContains(FuncAddr, "push ") ||
-					IsInstructionContains(FuncAddr, "sub ") ||
-					IsInstructionContains(FuncAddr, "lea ") ||
-					IsInstructionContains(FuncAddr, "cmp ") ||
-					IsInstructionContains(FuncAddr, "xor "))
+				// normal function header
+				if (IsInstructionContains(callDst, "mov ") ||
+					IsInstructionContains(callDst, "push ") ||
+					IsInstructionContains(callDst, "sub ") ||
+					IsInstructionContains(callDst, "lea ") ||
+					IsInstructionContains(callDst, "cmp ") ||
+					IsInstructionContains(callDst, "xor "))
 				{
-					g_BreakpointsManager.SetBreakPoint(FuncAddr);
-				}
-			}
-			else
-			{
-				// can't get dst addr, or dst not a user function, only thing we can do is set breakpoint at call instruction
-				sprintf_s(cmd, cmdSize, "dis.iscallsystem(%p)", (PVOID)addr);
-				if (!DbgEval(cmd))
-				{
-					sprintf_s(cmd, cmdSize, "dis.imm(%p) != 0 && !mem.iscode(dis.imm(%p))", (PVOID)addr, (PVOID)addr);
-					if (DbgEval(cmd))
+					g_BreakpointsManager->SetBreakPoint(callDst); // set breakpoint at function's first instruction
+
+					if (g_BreakpointsManager->GetBreakPointsCount() == MAX_BREAKPOINT_LIMIT)
 					{
-						// invalid call instruction
-					}
-					else
-					{
-						if (!IsBadInstruction(addr))
-						{
-							g_BreakpointsManager.SetBreakPoint(addr);
-						}
+						char buf[64] = { 0 };
+						sprintf_s(buf, _countof(buf), "%p", (PVOID)callDst);
+						SetWindowTextA(hEditAddrStart, buf);
+
+						char buf2[400] = { 0 };
+						sprintf_s(buf2, _countof(buf2),
+							"Setting a large number of breakpoints in x64dbg will cause the debugger to block, so a limit on the number of breakpoints is set. The first %d breakpoints have been set. The starting address has been updated. If the target function is not among the first %d functions, you only need to click the \"scan\" button to rescan.",
+							MAX_BREAKPOINT_LIMIT, MAX_BREAKPOINT_LIMIT);
+
+						MessageBoxA(0, buf2, "", MB_OK);
+						break;
 					}
 				}
 			}
@@ -243,7 +288,7 @@ size_t ScanFunctionsAndSetBreakPoints(duint base, duint size)
 		addr++;
 	}
 
-	return g_BreakpointsManager.GetBreakPointsCount();
+	return g_BreakpointsManager->GetBreakPointsCount();
 }
 
 INT_PTR CALLBACK PickDllDialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
@@ -318,9 +363,9 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 	{
 	case WM_INITDIALOG:
 		g_pluginDlg = hwndDlg;
-		hButtonSearch = GetDlgItem(hwndDlg, IDC_BUTTON1);
-		hButtonReset = GetDlgItem(hwndDlg, IDC_BUTTON2);
-		hButtonNewSearch = GetDlgItem(hwndDlg, IDC_BUTTON3);
+		hButtonSearch = GetDlgItem(hwndDlg, IDC_BUTTON_SEARCH);
+		hButtonPick = GetDlgItem(hwndDlg, IDC_BUTTON_PICK);
+		hButtonScan = GetDlgItem(hwndDlg, IDC_BUTTON_SCAN);
 		hEditCallCount = GetDlgItem(hwndDlg, IDC_EDIT1);
 		hEditResult = GetDlgItem(hwndDlg, IDC_EDIT2);
 		hEditAddrStart = GetDlgItem(hwndDlg, IDC_EDIT_ADDR_START);
@@ -328,7 +373,7 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 
 		return TRUE;
 	case WM_COMMAND:
-		if (LOWORD(wParam) == IDC_BUTTON1)
+		if (LOWORD(wParam) == IDC_BUTTON_SEARCH)
 		{
 			/*
 			Search button click
@@ -344,7 +389,7 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 			dprintf("searching functions of hit count %d\n", count);
 
 			GuiUpdateDisable();
-			std::vector<duint> breakpointsLeft = g_BreakpointsManager.FilterBreakPointsWithCallCount(count);
+			std::vector<duint> breakpointsLeft = g_BreakpointsManager->FilterBreakPointsWithCallCount(count);
 			GuiUpdateEnable(true);
 			GuiUpdateAllViews();
 
@@ -358,12 +403,12 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 				std::string hexStrAddr(stream.str());
 				output += hexStrAddr;
 				output += "\r\n";
-				SetWindowTextA(hEditResult, output.c_str());
 			}
+			SetWindowTextA(hEditResult, output.c_str());
 			
 			return TRUE;
 		}
-		else if (LOWORD(wParam) == IDC_BUTTON2)
+		else if (LOWORD(wParam) == IDC_BUTTON_SCAN)
 		{
 			/*
 			scan functions button click
@@ -374,24 +419,31 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 
 			SetWindowTextA(hEditResult, "scanning...");
 
-			PVOID addrStart = NULL;
-			PVOID addrEnd = NULL;
-			char buffer[256];
-			GetWindowTextA(GetDlgItem(hwndDlg, IDC_EDIT_ADDR_START), buffer, 256);
-			sscanf_s(buffer, "%p", &addrStart);
-			GetWindowTextA(GetDlgItem(hwndDlg, IDC_EDIT_ADDR_END), buffer, 256);
-			sscanf_s(buffer, "%p", &addrEnd);
-			dprintf("scanning address range: %p -> %p\n", addrStart, addrEnd);
+			EnableWindow(hButtonScan, FALSE);
+			EnableWindow(hButtonSearch, FALSE);
 
-			GuiUpdateDisable();
-			size_t cnt = ScanFunctionsAndSetBreakPoints((duint)addrStart, (duint)addrEnd - (duint)addrStart);
-			GuiUpdateEnable(true);
-			GuiUpdateAllViews();
+			new std::thread(([hwndDlg]() {
+				PVOID addrStart = NULL;
+				PVOID addrEnd = NULL;
+				char buffer[256];
+				GetWindowTextA(GetDlgItem(hwndDlg, IDC_EDIT_ADDR_START), buffer, 256);
+				sscanf_s(buffer, "%p", &addrStart);
+				GetWindowTextA(GetDlgItem(hwndDlg, IDC_EDIT_ADDR_END), buffer, 256);
+				sscanf_s(buffer, "%p", &addrEnd);
+				dprintf("scanning address range: %p -> %p\n", addrStart, addrEnd);
 
-			sprintf_s(buffer, _countof(buffer), "%Id breakpoints set", cnt);
-			SetWindowTextA(hEditResult, buffer);
+				GuiUpdateDisable();
+				size_t cnt = ScanFunctionsAndSetBreakPoints((duint)addrStart, (duint)addrEnd - (duint)addrStart);
+				GuiUpdateEnable(true);
+				GuiUpdateAllViews();
 
-			UpdateWindow(g_hwndDlg);
+				sprintf_s(buffer, _countof(buffer), "%Id breakpoints set", cnt);
+				SetWindowTextA(hEditResult, buffer);
+
+				EnableWindow(hButtonScan, TRUE);
+				EnableWindow(hButtonSearch, TRUE);
+				UpdateWindow(g_hwndDlg);
+			}));
 		}
 		else if (LOWORD(wParam) == IDC_BUTTON_PICK)
 		{
@@ -414,7 +466,6 @@ void pluginSetup()
 //Deinitialize your plugin data here.
 void pluginStop()
 {
-
 }
 
 // register menu to popup main window

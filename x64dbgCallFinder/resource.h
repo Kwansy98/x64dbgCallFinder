@@ -6,7 +6,9 @@
 #define IDD_DIALOG2                     103
 #define IDC_EDIT1                       1001
 #define IDC_BUTTON1                     1002
+#define IDC_BUTTON_SEARCH               1002
 #define IDC_BUTTON2                     1003
+#define IDC_BUTTON_SCAN                 1003
 #define IDC_EDIT2                       1004
 #define IDC_BUTTON3                     1005
 #define IDC_BUTTON_PICK                 1005
