@@ -9,8 +9,6 @@ using namespace Script::Symbol;
 using namespace Script::Debug;
 using namespace Script::Register;
 
-// Delaying execution when setting breakpoints can reduce the probability of UI blocking
-#define DELAY_MAGIC() Sleep(50)
 
 class BreakPointManager
 {
@@ -48,8 +46,6 @@ public:
 		Cmd(cmd);
 
 		breakpoints[addr] = true;
-
-		DELAY_MAGIC();
 	}
 
 	void RemoveBreakPoint(duint addr)
@@ -347,7 +343,10 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 			sscanf_s(buffer, "%d", &count);
 			dprintf("searching functions of hit count %d\n", count);
 
+			GuiUpdateDisable();
 			std::vector<duint> breakpointsLeft = g_BreakpointsManager.FilterBreakPointsWithCallCount(count);
+			GuiUpdateEnable(true);
+			GuiUpdateAllViews();
 
 			std::string output;
 			output = std::to_string(breakpointsLeft.size()) + " functions left\r\n";
@@ -374,13 +373,6 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 			*/
 
 			SetWindowTextA(hEditResult, "scanning...");
-			
-			EnableWindow(hButtonSearch, FALSE);
-			EnableWindow(hButtonReset, FALSE);
-			EnableWindow(hButtonNewSearch, FALSE);
-			EnableWindow(hEditCallCount, FALSE);
-			EnableWindow(hEditResult, FALSE);
-			UpdateWindow(g_hwndDlg);
 
 			PVOID addrStart = NULL;
 			PVOID addrEnd = NULL;
@@ -391,15 +383,14 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 			sscanf_s(buffer, "%p", &addrEnd);
 			dprintf("scanning address range: %p -> %p\n", addrStart, addrEnd);
 
+			GuiUpdateDisable();
 			size_t cnt = ScanFunctionsAndSetBreakPoints((duint)addrStart, (duint)addrEnd - (duint)addrStart);
+			GuiUpdateEnable(true);
+			GuiUpdateAllViews();
+
 			sprintf_s(buffer, _countof(buffer), "%Id breakpoints set", cnt);
 			SetWindowTextA(hEditResult, buffer);
 
-			EnableWindow(hButtonSearch, TRUE);
-			EnableWindow(hButtonReset, TRUE);
-			EnableWindow(hButtonNewSearch, TRUE);
-			EnableWindow(hEditCallCount, TRUE);
-			EnableWindow(hEditResult, TRUE);
 			UpdateWindow(g_hwndDlg);
 		}
 		else if (LOWORD(wParam) == IDC_BUTTON_PICK)
