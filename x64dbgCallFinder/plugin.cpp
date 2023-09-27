@@ -107,6 +107,16 @@ public:
 		}
 		return false;
 	}
+
+	std::vector<duint> GetBreakPointsList()
+	{
+		std::vector<duint> bps;
+		for (auto &item : breakpoints)
+		{
+			bps.push_back(item.first);
+		}
+		return bps;
+	}
 };
 
 // initialize in attach, destruct in dettach
@@ -117,7 +127,7 @@ HWND hButtonSearch;
 HWND hButtonScan;
 HWND hButtonPick;
 HWND hEditCallCount;
-HWND hEditResult;
+HWND hFunctionList;
 HWND hEditAddrStart;
 HWND hEditAddrEnd;
 
@@ -206,7 +216,7 @@ duint NextInstruct(duint addr)
 }
 
 // find all user defined functions in secific address range, and then set breakpoints
-size_t ScanFunctionsAndSetBreakPoints(duint base, duint size)
+std::vector<duint> ScanFunctionsAndSetBreakPoints(duint base, duint size)
 {
 	g_BreakpointsManager->Clear(); // Before rescanning the function, remove previously set breakpoints
 
@@ -298,7 +308,7 @@ size_t ScanFunctionsAndSetBreakPoints(duint base, duint size)
 		addr++;
 	}
 
-	return g_BreakpointsManager->GetBreakPointsCount();
+	return g_BreakpointsManager->GetBreakPointsList();
 }
 
 INT_PTR CALLBACK PickDllDialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
@@ -377,7 +387,7 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 		hButtonPick = GetDlgItem(hwndDlg, IDC_BUTTON_PICK);
 		hButtonScan = GetDlgItem(hwndDlg, IDC_BUTTON_SCAN);
 		hEditCallCount = GetDlgItem(hwndDlg, IDC_EDIT1);
-		hEditResult = GetDlgItem(hwndDlg, IDC_EDIT2);
+		hFunctionList = GetDlgItem(hwndDlg, IDC_LIST_FUNCTION);
 		hEditAddrStart = GetDlgItem(hwndDlg, IDC_EDIT_ADDR_START);
 		hEditAddrEnd = GetDlgItem(hwndDlg, IDC_EDIT_ADDR_END);
 
@@ -403,18 +413,22 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 			GuiUpdateEnable(true);
 			GuiUpdateAllViews();
 
-			std::string output;
-			output = std::to_string(breakpointsLeft.size()) + " functions left\r\n";
-			for (auto &item : breakpointsLeft)
+			std::sort(breakpointsLeft.begin(), breakpointsLeft.end(), [](const duint &p1, const duint &p2) {
+				return p1 < p2;
+			});
+
+			// clear the list
+			SendMessage(hFunctionList, LB_RESETCONTENT, 0, 0);
+
+			for (size_t i = 0; i < breakpointsLeft.size(); i++)
 			{
-				dprintf("%p\n", (PVOID)item);
 				std::stringstream stream;
-				stream << std::hex << (PVOID)item;
+				stream << std::hex << (PVOID)breakpointsLeft[i];
 				std::string hexStrAddr(stream.str());
-				output += hexStrAddr;
-				output += "\r\n";
+				int pos = (int)SendMessageA(hFunctionList, LB_INSERTSTRING, i,
+					(LPARAM)hexStrAddr.c_str());
 			}
-			SetWindowTextA(hEditResult, output.c_str());
+			SetFocus(hFunctionList);
 			
 			return TRUE;
 		}
@@ -427,10 +441,10 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 			scan the functions within the address range, and set conditional breakpoints
 			*/
 
-			SetWindowTextA(hEditResult, "scanning...");
-
 			EnableWindow(hButtonScan, FALSE);
 			EnableWindow(hButtonSearch, FALSE);
+			EnableWindow(hButtonPick, FALSE);
+			
 
 			new std::thread(([hwndDlg]() {
 				PVOID addrStart = NULL;
@@ -443,17 +457,48 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 				dprintf("scanning address range: %p -> %p\n", addrStart, addrEnd);
 
 				GuiUpdateDisable();
-				size_t cnt = ScanFunctionsAndSetBreakPoints((duint)addrStart, (duint)addrEnd - (duint)addrStart);
+				std::vector<duint> bpList = ScanFunctionsAndSetBreakPoints((duint)addrStart, (duint)addrEnd - (duint)addrStart);
 				GuiUpdateEnable(true);
 				GuiUpdateAllViews();
 
-				sprintf_s(buffer, _countof(buffer), "%Id breakpoints set", cnt);
-				SetWindowTextA(hEditResult, buffer);
+				for (size_t i = 0; i < bpList.size(); i++)
+				{
+					std::stringstream stream;
+					stream << std::hex << (PVOID)bpList[i];
+					std::string hexStrAddr(stream.str());
+					int pos = (int)SendMessageA(hFunctionList, LB_INSERTSTRING, i,
+						(LPARAM)hexStrAddr.c_str());
+				}
+				SetFocus(hFunctionList);
+
+				dprintf("%Id breakpoints set", bpList.size());
 
 				EnableWindow(hButtonScan, TRUE);
 				EnableWindow(hButtonSearch, TRUE);
+				EnableWindow(hButtonPick, TRUE);
 				UpdateWindow(g_hwndDlg);
 			}));
+		}
+		else if (LOWORD(wParam) == IDC_LIST_FUNCTION)
+		{
+			switch (HIWORD(wParam))
+			{
+			case LBN_SELCHANGE:
+			{
+				HWND hwndList = GetDlgItem(hwndDlg, IDC_LIST_FUNCTION);
+
+				// Get selected index.
+				int lbItem = (int)SendMessage(hwndList, LB_GETCURSEL, 0, 0);
+
+				char text[100] = { 0 };
+				SendMessage(hwndList, LB_GETTEXT, lbItem, (LPARAM)text);
+
+				std::string cmd = "disasm ";
+				cmd += text;
+				Cmd(cmd.c_str());
+				return TRUE;
+			}
+			}
 		}
 		else if (LOWORD(wParam) == IDC_BUTTON_PICK)
 		{
