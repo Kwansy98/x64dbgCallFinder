@@ -521,7 +521,7 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 				bool bResumeLater = false;
 				if (BST_CHECKED == Button_GetCheck(hCheckPause))
 				{
-					Script::Debug::Pause();
+					Cmd("pause");
 					bResumeLater = true;
 				}
 				GuiUpdateDisable();
@@ -531,7 +531,7 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 
 				if (bResumeLater)
 				{
-					Script::Debug::Run();
+					Cmd("run");
 				}
 
 				ListBox_ResetContent(hFunctionList);
