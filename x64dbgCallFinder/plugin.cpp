@@ -2,9 +2,6 @@
 
 #include <iostream>
 #include <fstream>
-#include <sstream>
-#include <Shlwapi.h>
-#pragma comment(lib,"Shlwapi.lib")
 
 #ifdef _UNICODE
 #error "USE ASCII CODE PAGE"
@@ -16,7 +13,7 @@ using namespace Script::Debug;
 using namespace Script::Register;
 
 /*
-The maximum number of breakpoints allowed to be set. 
+The maximum number of breakpoints allowed to be set.
 Setting too many breakpoints at once can cause serious degradation in debugger performance.
 */
 #define MAX_BREAKPOINT_LIMIT 500
@@ -25,6 +22,7 @@ class BreakPointManager
 {
 private:
 	std::map<duint, bool> breakpoints;
+	duint highestBreakpointAddress; // used to update the starting address. Automatically update this value when setting a breakpoint
 public:
 	~BreakPointManager()
 	{
@@ -38,6 +36,8 @@ public:
 		{
 			RemoveBreakPoint((*breakpoints.begin()).first);
 		}
+
+		highestBreakpointAddress = 0;
 	}
 
 	void SetBreakPoint(duint addr)
@@ -56,6 +56,11 @@ public:
 		Cmd(cmd);
 
 		breakpoints[addr] = true;
+
+		if (addr > highestBreakpointAddress)
+		{
+			highestBreakpointAddress = addr;
+		}
 	}
 
 	void RemoveBreakPoint(duint addr)
@@ -117,6 +122,11 @@ public:
 		}
 		return bps;
 	}
+
+	duint GetHighestAddressBreakpoint()
+	{
+		return highestBreakpointAddress;
+	}
 };
 
 // initialize in attach, destruct in dettach
@@ -128,12 +138,15 @@ HWND hButtonScan;
 HWND hButtonPick;
 HWND hEditCallCount;
 HWND hFunctionList;
+HWND hFunctionMarkeedList;
 HWND hEditAddrStart;
 HWND hEditAddrEnd;
+HWND hButtonUpdateStartAddress;
+HWND hButtonClearMarked;
 
 void DestructBreakpointsManagerCallback(CBTYPE bType, void*callbackInfo)
 {
-	if (g_BreakpointsManager) 
+	if (g_BreakpointsManager)
 	{
 		g_BreakpointsManager->Clear();
 		delete g_BreakpointsManager;
@@ -215,6 +228,14 @@ duint NextInstruct(duint addr)
 	return DbgEval(cmd);
 }
 
+void UpdateStartAddress()
+{
+	duint highest = g_BreakpointsManager->GetHighestAddressBreakpoint();
+	char newStartAddress[64] = { 0 };
+	sprintf_s(newStartAddress, _countof(newStartAddress), "%p", (PVOID)highest);
+	SetWindowTextA(hEditAddrStart, newStartAddress);
+}
+
 // find all user defined functions in secific address range, and then set breakpoints
 std::vector<duint> ScanFunctionsAndSetBreakPoints(duint base, duint size)
 {
@@ -227,7 +248,7 @@ std::vector<duint> ScanFunctionsAndSetBreakPoints(duint base, duint size)
 	duint addr = startAddress;
 
 	duint unCheckedPage = base;
-	
+
 	// find functions
 	while (addr < endAddress)
 	{
@@ -261,7 +282,7 @@ std::vector<duint> ScanFunctionsAndSetBreakPoints(duint base, duint size)
 			DISASM_INSTR di;
 			DbgDisasmAt((duint)addr, &di);
 			duint callDst = di.arg[0].value;
-			
+
 			// is dst a user function ?
 			sprintf_s(cmd, cmdSize, "mem.iscode(%p) && mod.user(%p)", (PVOID)callDst, (PVOID)callDst);
 			if (DbgEval(cmd))
@@ -290,13 +311,7 @@ std::vector<duint> ScanFunctionsAndSetBreakPoints(duint base, duint size)
 						int result = MessageBoxA(0, userMessage, "Automatically update the starting address?", MB_YESNO);
 						if (result == IDYES)
 						{
-							char newStartAddress[64] = { 0 };
-							sprintf_s(newStartAddress, _countof(newStartAddress), "%p", (PVOID)callDst);
-							SetWindowTextA(hEditAddrStart, newStartAddress);
-						}
-						else if (result == IDNO)
-						{
-							// ...
+							UpdateStartAddress();
 						}
 						break;
 					}
@@ -311,14 +326,47 @@ std::vector<duint> ScanFunctionsAndSetBreakPoints(duint base, duint size)
 	return g_BreakpointsManager->GetBreakPointsList();
 }
 
+VOID CenterDialog(HWND hDlg)
+{
+	HWND hwndOwner = NULL;
+	RECT rcOwner, rcDlg, rc;
+	// Get the owner window and dialog box rectangles. 			
+	if ((hwndOwner = GetParent(hDlg)) == NULL)
+	{
+		hwndOwner = GetDesktopWindow();
+	}
+	GetWindowRect(hwndOwner, &rcOwner);
+	GetWindowRect(hDlg, &rcDlg);
+	CopyRect(&rc, &rcOwner);
+
+	// Offset the owner and dialog box rectangles so that right and bottom 
+	// values represent the width and height, and then offset the owner again 
+	// to discard space taken up by the dialog box. 
+
+	OffsetRect(&rcDlg, -rcDlg.left, -rcDlg.top);
+	OffsetRect(&rc, -rc.left, -rc.top);
+	OffsetRect(&rc, -rcDlg.right, -rcDlg.bottom);
+
+	// The new position is the sum of half the remaining space and the owner's 
+	// original position. 
+
+	SetWindowPos(hDlg,
+		HWND_TOP,
+		rcOwner.left + (rc.right / 2),
+		rcOwner.top + (rc.bottom / 2),
+		0, 0,          // Ignores size arguments. 
+		SWP_NOSIZE);
+}
+
 INT_PTR CALLBACK PickDllDialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
 	static std::vector<ModuleInfo> *dlls = nullptr;
 
-	switch (uMsg)
+	if (uMsg == WM_INITDIALOG)
 	{
-	case WM_INITDIALOG:
-	{
+		// center dialog
+		CenterDialog(hwndDlg);
+
 		dlls = new std::vector<ModuleInfo>;
 		HWND hwndList = GetDlgItem(hwndDlg, IDC_LIST_DLL);
 
@@ -335,7 +383,7 @@ INT_PTR CALLBACK PickDllDialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARA
 		}
 
 		std::sort(dlls->begin(), dlls->end(), [](const ModuleInfo &m1, const ModuleInfo &m2) {
-			
+
 			return m1.base < m2.base;
 		});
 
@@ -346,15 +394,17 @@ INT_PTR CALLBACK PickDllDialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARA
 				(LPARAM)dlls->at(i).name);
 		}
 		SetFocus(hwndList);
-		break;
+
+		return TRUE;
 	}
-	case WM_CLOSE: 
+	else if (uMsg == WM_CLOSE)
 	{
 		delete dlls;
 		EndDialog(hwndDlg, 0);
 		return TRUE;
 	}
-	case WM_COMMAND:
+	else if (uMsg == WM_COMMAND)
+	{
 		if (LOWORD(wParam) == IDC_BUTTON_PICK_DLL)
 		{
 			HWND hwndList = GetDlgItem(hwndDlg, IDC_LIST_DLL);
@@ -379,26 +429,33 @@ INT_PTR CALLBACK PickDllDialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARA
 
 INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
-	switch (uMsg)
+	if (uMsg == WM_INITDIALOG)
 	{
-	case WM_INITDIALOG:
 		g_pluginDlg = hwndDlg;
 		hButtonSearch = GetDlgItem(hwndDlg, IDC_BUTTON_SEARCH);
 		hButtonPick = GetDlgItem(hwndDlg, IDC_BUTTON_PICK);
 		hButtonScan = GetDlgItem(hwndDlg, IDC_BUTTON_SCAN);
 		hEditCallCount = GetDlgItem(hwndDlg, IDC_EDIT1);
 		hFunctionList = GetDlgItem(hwndDlg, IDC_LIST_FUNCTION);
+		hFunctionMarkeedList = GetDlgItem(hwndDlg, IDC_LIST_FUNCTION_MARK);
 		hEditAddrStart = GetDlgItem(hwndDlg, IDC_EDIT_ADDR_START);
 		hEditAddrEnd = GetDlgItem(hwndDlg, IDC_EDIT_ADDR_END);
+		hButtonUpdateStartAddress = GetDlgItem(hwndDlg, IDC_BUTTON_UPDATE_ADDR);
+		hButtonClearMarked = GetDlgItem(hwndDlg, IDC_BUTTON_CLEAR_MARKED);
+
+		// center dialog
+		CenterDialog(hwndDlg);
 
 		return TRUE;
-	case WM_COMMAND:
+	}
+	else if (uMsg == WM_COMMAND)
+	{
 		if (LOWORD(wParam) == IDC_BUTTON_SEARCH)
 		{
 			/*
 			Search button click
 
-			Get the number of calls input by the user from the edit box, 
+			Get the number of calls input by the user from the edit box,
 			and then delete the breakpoints that do not meet the conditions
 			*/
 
@@ -418,7 +475,7 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 			});
 
 			// clear the list
-			SendMessage(hFunctionList, LB_RESETCONTENT, 0, 0);
+			ListBox_ResetContent(hFunctionList);
 
 			for (size_t i = 0; i < breakpointsLeft.size(); i++)
 			{
@@ -429,22 +486,22 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 					(LPARAM)hexStrAddr.c_str());
 			}
 			SetFocus(hFunctionList);
-			
-			return TRUE;
 		}
 		else if (LOWORD(wParam) == IDC_BUTTON_SCAN)
 		{
 			/*
 			scan functions button click
 
-			Get the user-specified address range from the edit box, 
+			Get the user-specified address range from the edit box,
 			scan the functions within the address range, and set conditional breakpoints
 			*/
 
 			EnableWindow(hButtonScan, FALSE);
 			EnableWindow(hButtonSearch, FALSE);
 			EnableWindow(hButtonPick, FALSE);
-			
+			EnableWindow(hButtonUpdateStartAddress, FALSE);
+			EnableWindow(hButtonClearMarked, FALSE);
+
 
 			new std::thread(([hwndDlg]() {
 				PVOID addrStart = NULL;
@@ -461,13 +518,13 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 				GuiUpdateEnable(true);
 				GuiUpdateAllViews();
 
+				ListBox_ResetContent(hFunctionList);
+
 				for (size_t i = 0; i < bpList.size(); i++)
 				{
-					std::stringstream stream;
-					stream << std::hex << (PVOID)bpList[i];
-					std::string hexStrAddr(stream.str());
-					int pos = (int)SendMessageA(hFunctionList, LB_INSERTSTRING, i,
-						(LPARAM)hexStrAddr.c_str());
+					char text[64] = { 0 };
+					sprintf_s(text, _countof(text), "%p", (PVOID)bpList[i]);
+					ListBox_InsertString(hFunctionList, i, text);
 				}
 				SetFocus(hFunctionList);
 
@@ -476,36 +533,81 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 				EnableWindow(hButtonScan, TRUE);
 				EnableWindow(hButtonSearch, TRUE);
 				EnableWindow(hButtonPick, TRUE);
+				EnableWindow(hButtonUpdateStartAddress, TRUE);
+				EnableWindow(hButtonClearMarked, TRUE);
 				UpdateWindow(g_hwndDlg);
 			}));
 		}
 		else if (LOWORD(wParam) == IDC_LIST_FUNCTION)
 		{
-			switch (HIWORD(wParam))
+			if (HIWORD(wParam) == LBN_SELCHANGE)
 			{
-			case LBN_SELCHANGE:
-			{
-				HWND hwndList = GetDlgItem(hwndDlg, IDC_LIST_FUNCTION);
-
-				// Get selected index.
-				int lbItem = (int)SendMessage(hwndList, LB_GETCURSEL, 0, 0);
-
-				char text[100] = { 0 };
-				SendMessage(hwndList, LB_GETTEXT, lbItem, (LPARAM)text);
-
-				std::string cmd = "disasm ";
-				cmd += text;
-				Cmd(cmd.c_str());
-				return TRUE;
+				int index = ListBox_GetCurSel(hFunctionList);
+				if (index != LB_ERR)
+				{
+					char text[64] = { 0 };
+					ListBox_GetText(hFunctionList, index, text);
+					std::string cmd = "disasm ";
+					cmd += text;
+					Cmd(cmd.c_str());
+				}
 			}
+			else if (HIWORD(wParam) == LBN_DBLCLK)
+			{
+				char text[64] = { 0 };
+				int index = ListBox_GetCurSel(hFunctionList);
+				if (index != LB_ERR)
+				{
+					ListBox_GetText(hFunctionList, index, text);
+					int found = ListBox_FindString(hFunctionMarkeedList, 0, text);
+					if (found == LB_ERR)
+					{
+						ListBox_AddString(hFunctionMarkeedList, text);
+					}
+				}
+			}
+		}
+		else if (LOWORD(wParam) == IDC_LIST_FUNCTION_MARK)
+		{
+			if (HIWORD(wParam) == LBN_SELCHANGE)
+			{
+				int index = ListBox_GetCurSel(hFunctionMarkeedList);
+				if (index != LB_ERR)
+				{
+					char text[64] = { 0 };
+					ListBox_GetText(hFunctionMarkeedList, index, text);
+					std::string cmd = "disasm ";
+					cmd += text;
+					Cmd(cmd.c_str());
+				}
+			}
+			else if (HIWORD(wParam) == LBN_DBLCLK)
+			{
+				char text[64] = { 0 };
+				int index = ListBox_GetCurSel(hFunctionMarkeedList);
+				if (index != LB_ERR)
+				{
+					ListBox_DeleteString(hFunctionMarkeedList, index);
+				}
 			}
 		}
 		else if (LOWORD(wParam) == IDC_BUTTON_PICK)
 		{
 			DialogBoxA(g_hInstance, MAKEINTRESOURCEA(IDD_DIALOG2), hwndDlg, PickDllDialogProc);
 		}
+		else if (LOWORD(wParam) == IDC_BUTTON_UPDATE_ADDR)
+		{
+			UpdateStartAddress();
+		}
+		else if (LOWORD(wParam) == IDC_BUTTON_CLEAR_MARKED)
+		{
+			ListBox_ResetContent(hFunctionMarkeedList);
+		}
+
 		return TRUE;
-	case WM_CLOSE:
+	}
+	else if (uMsg == WM_CLOSE)
+	{
 		ShowWindow(hwndDlg, SW_HIDE);
 		return TRUE;
 	}
@@ -533,7 +635,7 @@ extern "C" __declspec(dllexport) void CBMENUENTRY(CBTYPE cbType, PLUG_CB_MENUENT
 		}));
 		return;
 	}
-	
+
 	switch (info->hEntry)
 	{
 	case MENU_MAINWINDOW_POPUP:

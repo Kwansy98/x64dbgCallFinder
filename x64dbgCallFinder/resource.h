@@ -19,8 +19,11 @@
 #define IDC_LIST1                       1009
 #define IDC_LIST_DLL                    1009
 #define IDC_BUTTON_PICK_DLL             1010
-#define IDC_LIST2                       1011
 #define IDC_LIST_FUNCTION               1011
+#define IDC_BUTTON5                     1013
+#define IDC_BUTTON_CLEAR_MARKED         1013
+#define IDC_LIST_FUNCTION_MARK          1014
+#define IDC_BUTTON_UPDATE_ADDR          1015
 
 // Next default values for new objects
 // 
@@ -28,7 +31,7 @@
 #ifndef APSTUDIO_READONLY_SYMBOLS
 #define _APS_NEXT_RESOURCE_VALUE        105
 #define _APS_NEXT_COMMAND_VALUE         40001
-#define _APS_NEXT_CONTROL_VALUE         1012
+#define _APS_NEXT_CONTROL_VALUE         1016
 #define _APS_NEXT_SYMED_VALUE           101
 #endif
 #endif
