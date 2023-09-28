@@ -143,6 +143,7 @@ HWND hEditAddrStart;
 HWND hEditAddrEnd;
 HWND hButtonUpdateStartAddress;
 HWND hButtonClearMarked;
+HWND hCheckPause;
 
 void DestructBreakpointsManagerCallback(CBTYPE bType, void*callbackInfo)
 {
@@ -442,6 +443,10 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 		hEditAddrEnd = GetDlgItem(hwndDlg, IDC_EDIT_ADDR_END);
 		hButtonUpdateStartAddress = GetDlgItem(hwndDlg, IDC_BUTTON_UPDATE_ADDR);
 		hButtonClearMarked = GetDlgItem(hwndDlg, IDC_BUTTON_CLEAR_MARKED);
+		hCheckPause = GetDlgItem(hwndDlg, IDC_CHECK_PAUSE);
+
+		// pause while scanning by default
+		Button_SetCheck(hCheckPause, BST_CHECKED);
 
 		// center dialog
 		CenterDialog(hwndDlg);
@@ -513,10 +518,21 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 				sscanf_s(buffer, "%p", &addrEnd);
 				dprintf("scanning address range: %p -> %p\n", addrStart, addrEnd);
 
+				bool bResumeLater = false;
+				if (BST_CHECKED == Button_GetCheck(hCheckPause))
+				{
+					Script::Debug::Pause();
+					bResumeLater = true;
+				}
 				GuiUpdateDisable();
 				std::vector<duint> bpList = ScanFunctionsAndSetBreakPoints((duint)addrStart, (duint)addrEnd - (duint)addrStart);
 				GuiUpdateEnable(true);
 				GuiUpdateAllViews();
+
+				if (bResumeLater)
+				{
+					Script::Debug::Run();
+				}
 
 				ListBox_ResetContent(hFunctionList);
 

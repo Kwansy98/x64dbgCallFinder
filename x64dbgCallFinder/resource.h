@@ -13,6 +13,7 @@
 #define IDC_BUTTON3                     1005
 #define IDC_BUTTON_PICK                 1005
 #define IDC_CHECK1                      1006
+#define IDC_CHECK_PAUSE                 1006
 #define IDC_CHECK2                      1007
 #define IDC_EDIT_ADDR_START             1008
 #define IDC_EDIT_ADDR_END               1009
@@ -20,7 +21,6 @@
 #define IDC_LIST_DLL                    1009
 #define IDC_BUTTON_PICK_DLL             1010
 #define IDC_LIST_FUNCTION               1011
-#define IDC_BUTTON5                     1013
 #define IDC_BUTTON_CLEAR_MARKED         1013
 #define IDC_LIST_FUNCTION_MARK          1014
 #define IDC_BUTTON_UPDATE_ADDR          1015
