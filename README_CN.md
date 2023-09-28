@@ -3,7 +3,8 @@
 通过条件断点高效地定位关键函数，用法和Cheat Engine非常类似。
 
 
-![](images/1.gif)
+
+![](images/1.png)
 
 ## 安装
 
