@@ -16,7 +16,7 @@ using namespace Script::Register;
 The maximum number of breakpoints allowed to be set.
 Setting too many breakpoints at once can cause serious degradation in debugger performance.
 */
-#define MAX_BREAKPOINT_LIMIT 500
+#define MAX_BREAKPOINT_LIMIT 10000
 
 class BreakPointManager
 {
@@ -53,6 +53,8 @@ public:
 		sprintf_s(cmd, cmdSize, "bp %p", (PVOID)addr);
 		Cmd(cmd);
 		sprintf_s(cmd, cmdSize, "bpcnd %p,\"0\"", (PVOID)addr); // break if 0
+		Cmd(cmd);
+		sprintf_s(cmd, cmdSize, "SetBreakpointFastResume %p,\"1\"", (PVOID)addr); // fast resume
 		Cmd(cmd);
 
 		breakpoints[addr] = true;
@@ -144,6 +146,16 @@ HWND hEditAddrEnd;
 HWND hButtonUpdateStartAddress;
 HWND hButtonClearMarked;
 HWND hCheckPause;
+HWND g_hDialogProgressBar = NULL;
+HWND hButtonStopScanning;
+HWND hButtonStopSettingBreakpoints;
+bool g_bStopScanning = false;
+bool g_bStopSettingBreakpoint = false;
+HWND hStaticProgress;
+
+
+
+
 
 void DestructBreakpointsManagerCallback(CBTYPE bType, void*callbackInfo)
 {
@@ -242,6 +254,12 @@ std::vector<duint> ScanFunctionsAndSetBreakPoints(duint base, duint size)
 {
 	g_BreakpointsManager->Clear(); // Before rescanning the function, remove previously set breakpoints
 
+	// waiting for the progressbar dialog initialized
+	while (!g_hDialogProgressBar)
+	{
+		Sleep(500);
+	}
+
 	constexpr int cmdSize = 0x100;
 	char cmd[cmdSize] = { 0 };
 	duint startAddress = base;
@@ -249,6 +267,8 @@ std::vector<duint> ScanFunctionsAndSetBreakPoints(duint base, duint size)
 	duint addr = startAddress;
 
 	duint unCheckedPage = base;
+
+	std::vector<duint> functions;
 
 	// find functions
 	while (addr < endAddress)
@@ -296,33 +316,63 @@ std::vector<duint> ScanFunctionsAndSetBreakPoints(duint base, duint size)
 					IsInstructionContains(callDst, "cmp ") ||
 					IsInstructionContains(callDst, "xor "))
 				{
-					g_BreakpointsManager->SetBreakPoint(callDst); // set breakpoint at function's first instruction
-
-					if (g_BreakpointsManager->GetBreakPointsCount() == MAX_BREAKPOINT_LIMIT)
+					functions.push_back(callDst); // set breakpoint at function's first instruction
+					
+					if (functions.size() == MAX_BREAKPOINT_LIMIT)
 					{
-						char userMessage[400] = { 0 };
+						char userMessage[500] = { 0 };
 						sprintf_s(userMessage, _countof(userMessage),
 							"Setting a large number of breakpoints would cause x64dbg to block, "\
-							"so only %d breakpoints were set. The key function may not be among them. "\
-							"Clicking the \"Yes\" button will automatically set the last breakpoint to the new starting address. "\
-							"You can then scan the function again with the new starting address."\
-							"Or clicking the \"No\" button will not update the starting address.",
+							"so only %d breakpoints were set. The function you are looking for may not be among them. "\
+							"Clicking the \"YES\" button will stop adding new breakpoints."\
+							"You can then click the \"update start address\" button to update the starting address "\
+							"to the location of the last breakpoint to start the next scan; "\
+							"or click the \"NO\" button to ignore performance issues and continue adding breakpoint.",
 							MAX_BREAKPOINT_LIMIT);
 
-						int result = MessageBoxA(0, userMessage, "Automatically update the starting address?", MB_YESNO);
+						int result = MessageBoxA(0, userMessage, "End scanning?", MB_YESNO);
 						if (result == IDYES)
 						{
-							UpdateStartAddress();
+							break;
 						}
-						break;
 					}
 				}
 			}
 		}
 
+		if (g_bStopScanning)
+		{
+			break;
+		}
+		else
+		{
+			char text[100];
+			sprintf_s(text, _countof(text), "%Id found, scanning %p", functions.size(), (PVOID)addr);
+			Static_SetText(hStaticProgress, text);
+		}
+
 		//addr = NextInstruct(addr);
 		addr++;
 	}
+
+	size_t total = functions.size();
+	for (size_t current = 0; current < total; current++)
+	{
+		if (g_bStopSettingBreakpoint)
+		{
+			break;
+		}
+		else
+		{
+			char text[100];
+			sprintf_s(text, _countof(text), "setting breakpoints %Id/%Id", current, total);
+			Static_SetText(hStaticProgress, text);
+		}
+
+		g_BreakpointsManager->SetBreakPoint(functions[current]);
+	}
+
+	EndDialog(g_hDialogProgressBar, 0);
 
 	return g_BreakpointsManager->GetBreakPointsList();
 }
@@ -357,6 +407,51 @@ VOID CenterDialog(HWND hDlg)
 		rcOwner.top + (rc.bottom / 2),
 		0, 0,          // Ignores size arguments. 
 		SWP_NOSIZE);
+}
+
+INT_PTR CALLBACK ProgressBarDialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+	if (uMsg == WM_INITDIALOG)
+	{
+		hButtonStopScanning = GetDlgItem(hwndDlg, IDC_BUTTON_STOP_SCANNING);
+		hButtonStopSettingBreakpoints = GetDlgItem(hwndDlg, IDC_BUTTON_STOP_SETTING_BREAKPOINT);
+		hStaticProgress = GetDlgItem(hwndDlg, IDC_STATIC_PROGRESS);
+		EnableWindow(hButtonStopSettingBreakpoints, FALSE);
+
+		g_bStopScanning = false;
+		g_bStopSettingBreakpoint = false;
+		g_hDialogProgressBar = hwndDlg;
+
+		return TRUE;
+	}
+	else if (uMsg == WM_CLOSE)
+	{
+		// disable the close button
+		return TRUE;
+	}
+	else if (uMsg == WM_DESTROY)
+	{
+		g_hDialogProgressBar = NULL;
+		g_bStopScanning = false;
+		g_bStopSettingBreakpoint = false;
+		return TRUE;
+	}
+	else if (uMsg == WM_COMMAND)
+	{
+		if (LOWORD(wParam) == IDC_BUTTON_STOP_SCANNING)
+		{
+			g_bStopScanning = true;
+			EnableWindow(hButtonStopSettingBreakpoints, TRUE);
+			EnableWindow(hButtonStopScanning, FALSE);
+			return TRUE;
+		}
+		else if (LOWORD(wParam) == IDC_BUTTON_STOP_SETTING_BREAKPOINT)
+		{
+			g_bStopSettingBreakpoint = true;
+			return TRUE;
+		}
+	}
+	return FALSE;
 }
 
 INT_PTR CALLBACK PickDllDialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
@@ -501,13 +596,6 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 			scan the functions within the address range, and set conditional breakpoints
 			*/
 
-			EnableWindow(hButtonScan, FALSE);
-			EnableWindow(hButtonSearch, FALSE);
-			EnableWindow(hButtonPick, FALSE);
-			EnableWindow(hButtonUpdateStartAddress, FALSE);
-			EnableWindow(hButtonClearMarked, FALSE);
-
-
 			new std::thread(([hwndDlg]() {
 				PVOID addrStart = NULL;
 				PVOID addrEnd = NULL;
@@ -546,13 +634,11 @@ INT_PTR CALLBACK DialogProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPara
 
 				dprintf("%Id breakpoints set", bpList.size());
 
-				EnableWindow(hButtonScan, TRUE);
-				EnableWindow(hButtonSearch, TRUE);
-				EnableWindow(hButtonPick, TRUE);
-				EnableWindow(hButtonUpdateStartAddress, TRUE);
-				EnableWindow(hButtonClearMarked, TRUE);
 				UpdateWindow(g_hwndDlg);
 			}));
+
+			DialogBoxA(g_hInstance, MAKEINTRESOURCEA(IDD_DIALOG3), hwndDlg, ProgressBarDialogProc);
+
 		}
 		else if (LOWORD(wParam) == IDC_LIST_FUNCTION)
 		{

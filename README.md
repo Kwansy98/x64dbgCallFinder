@@ -38,10 +38,6 @@ Repeat the above steps until you find the onClick function.
 
 Search all user functions, and set a conditional breakpoint, the number of function calls will be recorded. Filter functions of interest based on call count.
 
-## TODO
-
-- Too many breakpoints cause the debugger to freeze
-
 ## See also
 
 cheat engine code filter:
